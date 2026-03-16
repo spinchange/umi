@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://universalmachine.dev/schema/disk/v1",
+  "$id": "https://spinchange.github.io/umi/schema/disk/v1",
   "title": "UMI Disk Object",
   "description": "Universal Machine Interface schema for disk/volume information. Implementations MUST return objects conforming to this schema regardless of host operating system.",
   "type": "object",

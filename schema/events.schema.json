@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://universalmachine.dev/schema/events/v1",
+  "$id": "https://spinchange.github.io/umi/schema/events/v1",
   "title": "UMI Event Object",
   "description": "Universal Machine Interface schema for system and application event logs.",
   "type": "object",

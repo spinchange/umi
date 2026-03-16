@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://universalmachine.dev/schema/uptime/v1",
+  "$id": "https://spinchange.github.io/umi/schema/uptime/v1",
   "title": "UMI Uptime Object",
   "description": "Universal Machine Interface schema for system uptime and basic identity.",
   "type": "object",

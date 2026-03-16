@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://universalmachine.dev/schema/process/v1",
+  "$id": "https://spinchange.github.io/umi/schema/process/v1",
   "title": "UMI Process Object",
   "description": "Universal Machine Interface schema for running process information.",
   "type": "object",

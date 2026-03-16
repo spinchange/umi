@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://universalmachine.dev/schema/network/v1",
+  "$id": "https://spinchange.github.io/umi/schema/network/v1",
   "title": "UMI Network Interface Object",
   "description": "Universal Machine Interface schema for network interface information. One object per active interface.",
   "type": "object",

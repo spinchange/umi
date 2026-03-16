@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://universalmachine.dev/schema/user/v1",
+  "$id": "https://spinchange.github.io/umi/schema/user/v1",
   "title": "UMI User Object",
   "description": "Universal Machine Interface schema for user/account information on the local machine.",
   "type": "object",

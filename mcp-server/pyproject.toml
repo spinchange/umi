@@ -5,13 +5,32 @@ build-backend = "hatchling.build"
 [project]
 name = "umi-mcp"
 version = "0.1.0"
-description = "UMI MCP server — local system awareness for AI agents"
+description = "UMI MCP server — local system awareness for AI assistants"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+keywords = ["mcp", "ai", "agents", "system", "monitoring", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "mcp>=1.0.0",
     "psutil>=5.9.0",
 ]
+
+[project.urls]
+Homepage = "https://spinchange.github.io/umi"
+Repository = "https://github.com/spinchange/umi"
+"Bug Tracker" = "https://github.com/spinchange/umi/issues"
 
 [project.scripts]
 umi-mcp = "umi_mcp:main"
