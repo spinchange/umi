@@ -1,8 +1,12 @@
 import json
 import platform
+import re
 import subprocess
 from datetime import datetime, timezone
 
+
+# Matches PowerShell ConvertTo-Json DateTime format: /Date(milliseconds)/ or /Date(milliseconds+0000)/
+_MS_DATE_RE = re.compile(r"^/Date\((\d+)(?:[+-]\d{4})?\)/$")
 
 MAX_MESSAGE_LENGTH = 500
 COMMAND_TIMEOUT_SECONDS = 30
@@ -69,6 +73,13 @@ def _parse_timestamp(value) -> str | None:
     if text.isdigit():
         try:
             return datetime.fromtimestamp(int(text) / 1_000_000, tz=timezone.utc).isoformat()
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    m = _MS_DATE_RE.match(text)
+    if m:
+        try:
+            return datetime.fromtimestamp(int(m.group(1)) / 1000, tz=timezone.utc).isoformat()
         except (OSError, OverflowError, ValueError):
             return None
 

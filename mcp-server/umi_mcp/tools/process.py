@@ -1,3 +1,4 @@
+import platform
 import psutil
 from datetime import datetime, timezone
 
@@ -30,6 +31,8 @@ def get_process(name: str = None, top: int = None) -> list[dict]:
         if not info.get("name"):
             continue
         if name and name.lower() not in info["name"].lower():
+            continue
+        if platform.system() == "Windows" and info["name"] == "System Idle Process":
             continue
 
         mem_bytes = info["memory_info"].rss if info["memory_info"] else 0

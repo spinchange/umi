@@ -79,6 +79,47 @@ def _load_windows_drive_map() -> dict[str, str]:
     return mapping
 
 
+def _load_windows_label_map() -> dict[str, str | None]:
+    ps_cmd = (
+        "Get-Volume | "
+        "Where-Object { $_.DriveLetter } | "
+        "Select-Object DriveLetter, FileSystemLabel | "
+        "ConvertTo-Json -Compress"
+    )
+
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=WINDOWS_IO_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except OSError:
+        return {}
+
+    if out.returncode != 0 or not out.stdout.strip():
+        return {}
+
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+    if isinstance(data, dict):
+        data = [data]
+
+    mapping: dict[str, str | None] = {}
+    for entry in data:
+        drive_letter = entry.get("DriveLetter")
+        if not drive_letter:
+            continue
+        label = entry.get("FileSystemLabel") or None
+        mapping[f"{str(drive_letter).upper()}:\\"] = label
+
+    return mapping
+
+
 def _device_candidates(device_name: str | None, mount_point: str | None) -> list[str]:
     candidates: list[str] = []
     for raw in (device_name, mount_point):
@@ -149,7 +190,9 @@ def _extract_io_fields(io_counter) -> dict:
 
 def get_disk() -> list[dict]:
     io_counters = psutil.disk_io_counters(perdisk=True) or {}
-    windows_drive_map = _load_windows_drive_map() if platform.system() == "Windows" else {}
+    is_windows = platform.system() == "Windows"
+    windows_drive_map = _load_windows_drive_map() if is_windows else {}
+    windows_label_map = _load_windows_label_map() if is_windows else {}
     results = []
     for part in psutil.disk_partitions(all=False):
         if part.fstype.lower() in PSEUDO_FS:
@@ -164,6 +207,12 @@ def get_disk() -> list[dict]:
         used_pct = round((usage.used / usage.total) * 100, 1) if usage.total > 0 else 0.0
         io_counter = _resolve_io_counter(part, io_counters, windows_drive_map)
 
+        if is_windows:
+            drive_key = _normalize_windows_drive(part.device) or _normalize_windows_drive(part.mountpoint)
+            label = windows_label_map.get(drive_key) if drive_key else None
+        else:
+            label = None
+
         results.append({
             "DeviceName": part.device,
             "MountPoint": part.mountpoint,
@@ -173,7 +222,7 @@ def get_disk() -> list[dict]:
             "FreeBytes": usage.free,
             "UsedPercent": used_pct,
             "IsRemovable": False,
-            "Label": None,
+            "Label": label,
             **_extract_io_fields(io_counter),
         })
 

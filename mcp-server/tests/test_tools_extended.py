@@ -21,6 +21,7 @@ from umi_mcp.tools import disk, uptime, network, process, service, user, events
 
 
 class UptimeToolTests(unittest.TestCase):
+    @patch("umi_mcp.tools.uptime.subprocess.run")
     @patch("umi_mcp.tools.uptime.socket.gethostname", return_value="test-host")
     @patch("umi_mcp.tools.uptime.platform.machine", return_value="x86_64")
     @patch("umi_mcp.tools.uptime.psutil.cpu_count", return_value=8)
@@ -45,6 +46,7 @@ class UptimeToolTests(unittest.TestCase):
         _mock_cpu_count,
         _mock_machine,
         _mock_hostname,
+        mock_subprocess_run,
     ):
         # Mocking datetime.now and datetime.fromtimestamp
         mock_now = datetime(2024, 3, 16, 13, 0, 0, tzinfo=timezone.utc)
@@ -54,6 +56,7 @@ class UptimeToolTests(unittest.TestCase):
 
         mock_virtual_memory.return_value = SimpleNamespace(total=16000, used=8000, available=8000)
         mock_swap_memory.return_value = SimpleNamespace(total=4000, used=1000)
+        mock_subprocess_run.return_value = SimpleNamespace(stdout="7.4.6\n")
 
         result = uptime.get_uptime()
 
@@ -65,7 +68,12 @@ class UptimeToolTests(unittest.TestCase):
         self.assertEqual(result["UptimeHuman"], "0d 1h 0m")
         self.assertEqual(result["TotalMemoryBytes"], 16000)
         self.assertIsNone(result["LoadAverage1m"])
+        self.assertIsNone(result["LoadAverage5m"])
+        self.assertIsNone(result["LoadAverage15m"])
+        self.assertEqual(result["PowerShellVersion"], "7.4.6")
+        _mock_load.assert_not_called()
 
+    @patch("umi_mcp.tools.uptime.subprocess.run")
     @patch("umi_mcp.tools.uptime.psutil.getloadavg", return_value=(1.0, 0.5, 0.2), create=True)
     @patch("umi_mcp.tools.uptime.platform.mac_ver", return_value=("14.4", ("", "", ""), ""))
     @patch("umi_mcp.tools.uptime.platform.system", return_value="Darwin")
@@ -82,6 +90,7 @@ class UptimeToolTests(unittest.TestCase):
         _sys,
         _mac_ver,
         _load,
+        mock_subprocess_run,
     ):
         mock_now = datetime(2024, 3, 16, 13, 0, 0, tzinfo=timezone.utc)
         mock_boot = datetime(2024, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
@@ -97,6 +106,8 @@ class UptimeToolTests(unittest.TestCase):
         self.assertEqual(result["LoadAverage1m"], 1.0)
         self.assertEqual(result["LoadAverage5m"], 0.5)
         self.assertEqual(result["LoadAverage15m"], 0.2)
+        self.assertIsNone(result["PowerShellVersion"])
+        mock_subprocess_run.assert_not_called()
 
 
 class NetworkToolTests(unittest.TestCase):
@@ -563,6 +574,58 @@ class DiskToolExtendedCoverageTests(unittest.TestCase):
             self.assertIn(field, result[0])
             self.assertIsNone(result[0][field])
 
+    @patch("umi_mcp.tools.disk._load_windows_label_map", return_value={"C:\\": "System"})
+    @patch("umi_mcp.tools.disk._load_windows_drive_map", return_value={})
+    @patch("umi_mcp.tools.disk.psutil.disk_io_counters", return_value={})
+    @patch("umi_mcp.tools.disk.psutil.disk_usage")
+    @patch("umi_mcp.tools.disk.psutil.disk_partitions")
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Windows")
+    def test_get_disk_windows_populates_label_from_label_map(
+        self,
+        _mock_system,
+        mock_partitions,
+        mock_usage,
+        _mock_io_counters,
+        _mock_drive_map,
+        _mock_label_map,
+    ):
+        mock_partitions.return_value = [
+            SimpleNamespace(device="C:\\", mountpoint="C:\\", fstype="NTFS")
+        ]
+        mock_usage.return_value = SimpleNamespace(total=1000, used=500, free=500)
+
+        result = disk.get_disk()
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("Label", result[0])
+        self.assertEqual(result[0]["Label"], "System")
+
+    @patch("umi_mcp.tools.disk._load_windows_label_map", return_value={"C:\\": None})
+    @patch("umi_mcp.tools.disk._load_windows_drive_map", return_value={})
+    @patch("umi_mcp.tools.disk.psutil.disk_io_counters", return_value={})
+    @patch("umi_mcp.tools.disk.psutil.disk_usage")
+    @patch("umi_mcp.tools.disk.psutil.disk_partitions")
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Windows")
+    def test_get_disk_windows_keeps_null_label_key(
+        self,
+        _mock_system,
+        mock_partitions,
+        mock_usage,
+        _mock_io_counters,
+        _mock_drive_map,
+        _mock_label_map,
+    ):
+        mock_partitions.return_value = [
+            SimpleNamespace(device="C:\\", mountpoint="C:\\", fstype="NTFS")
+        ]
+        mock_usage.return_value = SimpleNamespace(total=1000, used=500, free=500)
+
+        result = disk.get_disk()
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("Label", result[0])
+        self.assertIsNone(result[0]["Label"])
+
 
 class ServiceToolExtendedCoverageTests(unittest.TestCase):
     @patch("umi_mcp.tools.service.subprocess.run")
@@ -689,6 +752,13 @@ class EventsHelperTests(unittest.TestCase):
         self.assertEqual(events._parse_timestamp("2024-03-16 12:00:00.000+0000"), "2024-03-16T12:00:00+00:00")
         self.assertEqual(events._parse_timestamp("2024-03-16 12:00:00+0000"), "2024-03-16T12:00:00+00:00")
         
+        # PowerShell ConvertTo-Json /Date(ms)/ format
+        self.assertEqual(events._parse_timestamp("/Date(1710590400000)/"), "2024-03-16T12:00:00+00:00")
+        # With timezone offset suffix (also emitted by some PS versions)
+        self.assertEqual(events._parse_timestamp("/Date(1710590400000+0000)/"), "2024-03-16T12:00:00+00:00")
+        # Malformed — should return None
+        self.assertIsNone(events._parse_timestamp("/Date()/"))
+
         # Invalid
         self.assertIsNone(events._parse_timestamp("invalid date"))
 
@@ -868,6 +938,48 @@ class DiskHelpersTests(unittest.TestCase):
         )
         self.assertEqual(disk._load_windows_drive_map(), {"D:\\": "PhysicalDrive1"})
 
+    # _load_windows_label_map error paths
+    @patch("umi_mcp.tools.disk.subprocess.run", side_effect=OSError("no powershell"))
+    def test_load_windows_label_map_oserror_returns_empty(self, _):
+        self.assertEqual(disk._load_windows_label_map(), {})
+
+    @patch("umi_mcp.tools.disk.subprocess.run")
+    def test_load_windows_label_map_bad_returncode_returns_empty(self, mock_run):
+        mock_run.return_value = SimpleNamespace(returncode=1, stdout="")
+        self.assertEqual(disk._load_windows_label_map(), {})
+
+    @patch("umi_mcp.tools.disk.subprocess.run")
+    def test_load_windows_label_map_bad_json_returns_empty(self, mock_run):
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="not json {{")
+        self.assertEqual(disk._load_windows_label_map(), {})
+
+    @patch("umi_mcp.tools.disk.subprocess.run")
+    def test_load_windows_label_map_single_dict_response(self, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"DriveLetter": "C", "FileSystemLabel": "System"}),
+        )
+        self.assertEqual(disk._load_windows_label_map(), {"C:\\": "System"})
+
+    @patch("umi_mcp.tools.disk.subprocess.run")
+    def test_load_windows_label_map_missing_drive_letter_skipped(self, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([
+                {"DriveLetter": None, "FileSystemLabel": "Ignored"},
+                {"DriveLetter": "D", "FileSystemLabel": "Data"},
+            ]),
+        )
+        self.assertEqual(disk._load_windows_label_map(), {"D:\\": "Data"})
+
+    @patch("umi_mcp.tools.disk.subprocess.run")
+    def test_load_windows_label_map_empty_label_stored_as_none(self, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"DriveLetter": "C", "FileSystemLabel": ""}),
+        )
+        self.assertEqual(disk._load_windows_label_map(), {"C:\\": None})
+
     # _device_candidates
     @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
     def test_device_candidates_dev_prefix_stripped(self, _):
@@ -990,6 +1102,36 @@ class ProcessEdgeCaseTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIsNone(result[0]["StartTime"])
         self.assertIsNone(result[0]["CommandLine"])
+
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    @patch("umi_mcp.tools.process.psutil.cpu_percent")
+    @patch("umi_mcp.tools.process.platform.system")
+    def test_system_idle_process_skipped_only_on_windows(self, mock_system, _, mock_iter):
+        mock_iter.return_value = [
+            MagicMock(info={
+                "pid": 0, "name": "System Idle Process", "ppid": 0, "cpu_percent": 556.0,
+                "memory_info": SimpleNamespace(rss=0), "memory_percent": 0.0,
+                "status": psutil.STATUS_RUNNING, "username": "SYSTEM",
+                "create_time": 1.0, "cmdline": [], "num_threads": 4,
+            }),
+            MagicMock(info={
+                "pid": 1, "name": "real_proc", "ppid": 0, "cpu_percent": 5.0,
+                "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
+                "status": psutil.STATUS_RUNNING, "username": "user",
+                "create_time": 1.0, "cmdline": ["real"], "num_threads": 1,
+            }),
+        ]
+
+        mock_system.return_value = "Windows"
+        windows_result = process.get_process()
+        self.assertEqual([entry["ProcessName"] for entry in windows_result], ["real_proc"])
+
+        mock_system.return_value = "Linux"
+        linux_result = process.get_process()
+        self.assertEqual(
+            [entry["ProcessName"] for entry in linux_result],
+            ["System Idle Process", "real_proc"],
+        )
 
 
 class ServiceAdditionalEdgeCaseTests(unittest.TestCase):

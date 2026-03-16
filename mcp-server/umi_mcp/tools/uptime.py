@@ -1,5 +1,6 @@
 import platform
 import socket
+import subprocess
 import psutil
 from datetime import datetime, timezone
 
@@ -11,6 +12,31 @@ ARCH_MAP = {
     "ARM64": "ARM64", "aarch64": "ARM64",
     "armv7l": "ARM", "arm": "ARM",
 }
+
+
+def _get_powershell_version(os_name: str) -> str | None:
+    if os_name != "Windows":
+        return None
+
+    try:
+        out = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.ToString()",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError:
+        return None
+
+    version = (out.stdout or "").strip()
+    return version or None
 
 
 def get_uptime() -> dict:
@@ -39,7 +65,11 @@ def get_uptime() -> dict:
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
     cpu_percent = psutil.cpu_percent(interval=0.5)
-    load_avg = psutil.getloadavg() if hasattr(psutil, "getloadavg") else None
+    if os_name == "Windows":
+        load_avg = None
+    else:
+        load_avg = psutil.getloadavg() if hasattr(psutil, "getloadavg") else None
+    powershell_version = _get_powershell_version(os_name)
 
     return {
         "Hostname": socket.gethostname(),
@@ -59,5 +89,5 @@ def get_uptime() -> dict:
         "LoadAverage1m": round(load_avg[0], 2) if load_avg else None,
         "LoadAverage5m": round(load_avg[1], 2) if load_avg else None,
         "LoadAverage15m": round(load_avg[2], 2) if load_avg else None,
-        "PowerShellVersion": None,
+        "PowerShellVersion": powershell_version,
     }
