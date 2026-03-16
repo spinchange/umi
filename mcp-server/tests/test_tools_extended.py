@@ -16,7 +16,7 @@ from umi_mcp.server import (
     get_umi_user,
     get_umi_service,
 )
-from umi_mcp.tools import disk, uptime, network, process, service, user
+from umi_mcp.tools import disk, uptime, network, process, service, user, events
 
 
 class UptimeToolTests(unittest.TestCase):
@@ -640,6 +640,169 @@ class ServiceToolExtendedCoverageTests(unittest.TestCase):
                 "ExitCode": None,
             }
         ])
+
+
+class EventsHelperTests(unittest.TestCase):
+    def test_truncate_message_none(self):
+        self.assertIsNone(events._truncate_message(None))
+
+    def test_parse_timestamp_none_or_empty(self):
+        self.assertIsNone(events._parse_timestamp(None))
+        self.assertIsNone(events._parse_timestamp(""))
+        self.assertIsNone(events._parse_timestamp("   "))
+
+    def test_parse_timestamp_numeric(self):
+        # Numeric (int/float)
+        ts = events._parse_timestamp(1710590400.0)
+        self.assertEqual(ts, "2024-03-16T12:00:00+00:00")
+        
+        # Digit string (microseconds)
+        ts_str = events._parse_timestamp("1710590400000000")
+        self.assertEqual(ts_str, "2024-03-16T12:00:00+00:00")
+        
+        # Overflow
+        self.assertIsNone(events._parse_timestamp(1e30))
+
+    def test_parse_timestamp_formats(self):
+        # ISO with Z
+        self.assertEqual(events._parse_timestamp("2024-03-16T12:00:00Z"), "2024-03-16T12:00:00+00:00")
+        
+        # ISO with space (supported by fromisoformat)
+        self.assertEqual(events._parse_timestamp("2024-03-16 12:00:00"), "2024-03-16T12:00:00+00:00")
+
+        # Fallback formats
+        self.assertEqual(events._parse_timestamp("2024-03-16 12:00:00.000+0000"), "2024-03-16T12:00:00+00:00")
+        self.assertEqual(events._parse_timestamp("2024-03-16 12:00:00+0000"), "2024-03-16T12:00:00+00:00")
+        
+        # Invalid
+        self.assertIsNone(events._parse_timestamp("invalid date"))
+
+
+class EventsToolExtendedTests(unittest.TestCase):
+    @patch("umi_mcp.tools.events.platform.system", return_value="FreeBSD")
+    def test_get_events_unknown_platform(self, _sys):
+        self.assertEqual(events.get_events(), [])
+
+    @patch("umi_mcp.tools.events.subprocess.run")
+    @patch("umi_mcp.tools.events.platform.system", return_value="Windows")
+    def test_get_events_windows_edge_cases(self, _sys, mock_run):
+        # OSError
+        mock_run.side_effect = OSError("Access denied")
+        self.assertEqual(events.get_events(), [])
+
+        # Non-zero returncode
+        mock_run.side_effect = None
+        mock_run.return_value = SimpleNamespace(returncode=1, stdout="")
+        self.assertEqual(events.get_events(), [])
+
+        # Empty stdout
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="  ")
+        self.assertEqual(events.get_events(), [])
+
+        # JSONDecodeError
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="invalid json")
+        self.assertEqual(events.get_events(), [])
+
+        # Single dict response
+        mock_run.return_value = SimpleNamespace(
+            returncode=0, 
+            stdout=json.dumps({"Id": 1, "Message": "single"})
+        )
+        res = events.get_events()
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["EventId"], 1)
+
+        # Source filter escaping
+        events.get_events(source="O'Reilly")
+        args, kwargs = mock_run.call_args
+        cmd = args[0][-1]
+        self.assertIn("O''Reilly", cmd)
+
+    @patch("umi_mcp.tools.events.subprocess.run")
+    @patch("umi_mcp.tools.events.platform.system", return_value="Windows")
+    def test_get_events_windows_missing_fields(self, _sys, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0, 
+            stdout=json.dumps([{"Message": "only message"}])
+        )
+        res = events.get_events()
+        self.assertEqual(len(res), 1)
+        self.assertIsNone(res[0]["EventId"])
+        self.assertIsNone(res[0]["Source"])
+        self.assertIsNone(res[0]["Timestamp"])
+        self.assertEqual(res[0]["Level"], "Unknown")
+
+    @patch("umi_mcp.tools.events.subprocess.run")
+    @patch("umi_mcp.tools.events.platform.system", return_value="Linux")
+    def test_get_events_linux_edge_cases(self, _sys, mock_run):
+        # OSError
+        mock_run.side_effect = OSError("cmd not found")
+        self.assertEqual(events.get_events(), [])
+
+        # Non-zero returncode
+        mock_run.side_effect = None
+        mock_run.return_value = SimpleNamespace(returncode=1, stdout="")
+        self.assertEqual(events.get_events(), [])
+
+        # Empty lines and malformed JSON lines
+        lines = [
+            "",
+            json.dumps({"MESSAGE": "ok", "PRIORITY": "3"}),
+            "not json",
+            json.dumps({"MESSAGE": "ok2", "PRIORITY": "3"}),
+        ]
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="\n".join(lines))
+        res = events.get_events(last_n=10)
+        self.assertEqual(len(res), 2)
+
+        # last_n break reached mid-iteration
+        lines_many = [json.dumps({"MESSAGE": f"msg{i}", "PRIORITY": "3"}) for i in range(5)]
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="\n".join(lines_many))
+        res_limited = events.get_events(last_n=2)
+        self.assertEqual(len(res_limited), 2)
+        self.assertEqual(res_limited[1]["Message"], "msg1")
+
+    @patch("umi_mcp.tools.events.subprocess.run")
+    @patch("umi_mcp.tools.events.platform.system", return_value="Darwin")
+    def test_get_events_macos_edge_cases(self, _sys, mock_run):
+        # OSError
+        mock_run.side_effect = OSError("crash")
+        self.assertEqual(events.get_events(), [])
+
+        # Non-zero returncode
+        mock_run.side_effect = None
+        mock_run.return_value = SimpleNamespace(returncode=1, stdout="")
+        self.assertEqual(events.get_events(), [])
+
+        # Empty/malformed lines
+        lines = [
+            "  ",
+            json.dumps({"eventMessage": "ok", "messageType": "error"}),
+            "{bad json",
+        ]
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="\n".join(lines))
+        res = events.get_events(level="Error")
+        self.assertEqual(len(res), 1)
+
+        # Level filter mismatch
+        lines_mixed = [
+            json.dumps({"eventMessage": "err", "messageType": "error"}),
+            json.dumps({"eventMessage": "info", "messageType": "info"}),
+        ]
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="\n".join(lines_mixed))
+        res_err = events.get_events(level="Error")
+        self.assertEqual(len(res_err), 1)
+        self.assertEqual(res_err[0]["Message"], "err")
+
+        # Source filter mismatch
+        lines_src = [
+            json.dumps({"eventMessage": "a", "messageType": "error", "subsystem": "com.apple.a"}),
+            json.dumps({"eventMessage": "b", "messageType": "error", "subsystem": "com.apple.b"}),
+        ]
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="\n".join(lines_src))
+        res_src = events.get_events(source="apple.a")
+        self.assertEqual(len(res_src), 1)
+        self.assertEqual(res_src[0]["Source"], "com.apple.a")
 
 
 if __name__ == "__main__":
