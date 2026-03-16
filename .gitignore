@@ -1,0 +1,22 @@
+# PowerShell
+*.ps1xml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node (if site tooling added later)
+node_modules/
+dist/
+
+# Test output
+TestResults/
+*.nupkg

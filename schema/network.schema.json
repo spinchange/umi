@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universalmachine.dev/schema/network/v1",
+  "title": "UMI Network Interface Object",
+  "description": "Universal Machine Interface schema for network interface information. One object per active interface.",
+  "type": "object",
+  "required": ["InterfaceName", "InterfaceType", "Status", "IPv4Address", "SubnetMask", "MacAddress"],
+  "properties": {
+    "InterfaceName": {
+      "type": "string",
+      "description": "Human-readable adapter name. Windows: 'Ethernet 2', Linux: 'eth0', macOS: 'en0'.",
+      "examples": ["Ethernet 2", "eth0", "en0", "wlan0", "Wi-Fi"]
+    },
+    "InterfaceType": {
+      "type": "string",
+      "enum": ["Ethernet", "WiFi", "Loopback", "Virtual", "Tunnel", "Unknown"],
+      "description": "Normalized interface category."
+    },
+    "Status": {
+      "type": "string",
+      "enum": ["Up", "Down", "Unknown"],
+      "description": "Current link state."
+    },
+    "IPv4Address": {
+      "type": ["string", "null"],
+      "description": "Primary IPv4 address, or null if none assigned.",
+      "examples": ["192.168.1.100", "10.0.0.5"]
+    },
+    "IPv6Address": {
+      "type": ["string", "null"],
+      "description": "Primary IPv6 address, or null if none assigned."
+    },
+    "SubnetMask": {
+      "type": ["string", "null"],
+      "description": "Subnet mask in dotted notation.",
+      "examples": ["255.255.255.0"]
+    },
+    "DefaultGateway": {
+      "type": ["string", "null"],
+      "description": "Default gateway IP, or null if not applicable."
+    },
+    "MacAddress": {
+      "type": ["string", "null"],
+      "description": "MAC address in colon-separated uppercase hex. Normalized from any OS format.",
+      "pattern": "^([0-9A-F]{2}:){5}[0-9A-F]{2}$",
+      "examples": ["AA:BB:CC:DD:EE:FF"]
+    },
+    "SpeedMbps": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Link speed in megabits per second, or null if unknown."
+    },
+    "DnsServers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of configured DNS server addresses."
+    }
+  },
+  "additionalProperties": false
+}

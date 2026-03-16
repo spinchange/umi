@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universalmachine.dev/schema/disk/v1",
+  "title": "UMI Disk Object",
+  "description": "Universal Machine Interface schema for disk/volume information. Implementations MUST return objects conforming to this schema regardless of host operating system.",
+  "type": "object",
+  "required": ["DeviceName", "MountPoint", "FileSystem", "TotalBytes", "UsedBytes", "FreeBytes", "UsedPercent"],
+  "properties": {
+    "DeviceName": {
+      "type": "string",
+      "description": "The OS-level device identifier. Windows: 'C:', Linux: '/dev/sda1', macOS: '/dev/disk1s1'.",
+      "examples": ["C:", "/dev/sda1", "/dev/disk1s1"]
+    },
+    "MountPoint": {
+      "type": "string",
+      "description": "Where the volume is mounted. Windows: 'C:\\', Linux/macOS: '/' or '/home'.",
+      "examples": ["C:\\", "/", "/home"]
+    },
+    "FileSystem": {
+      "type": "string",
+      "description": "The filesystem type. Normalized to uppercase.",
+      "examples": ["NTFS", "EXT4", "APFS", "BTRFS", "XFS"]
+    },
+    "TotalBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total capacity in bytes. Agents: divide by 1GB (1073741824) for human-readable display."
+    },
+    "UsedBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Bytes currently in use."
+    },
+    "FreeBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Bytes available for use."
+    },
+    "UsedPercent": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Percentage of disk used, rounded to 1 decimal place."
+    },
+    "IsRemovable": {
+      "type": "boolean",
+      "description": "True if this is a removable/external drive."
+    },
+    "Label": {
+      "type": ["string", "null"],
+      "description": "Volume label if one exists, null otherwise."
+    }
+  },
+  "additionalProperties": false
+}

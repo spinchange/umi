@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universalmachine.dev/schema/process/v1",
+  "title": "UMI Process Object",
+  "description": "Universal Machine Interface schema for running process information.",
+  "type": "object",
+  "required": ["ProcessName", "ProcessId", "CpuPercent", "MemoryBytes", "Status", "User"],
+  "properties": {
+    "ProcessName": {
+      "type": "string",
+      "description": "Name of the executable without path or extension.",
+      "examples": ["chrome", "python3", "svchost", "nginx"]
+    },
+    "ProcessId": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "OS-assigned process ID (PID)."
+    },
+    "ParentProcessId": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "PID of the parent process, or null if root/unknown."
+    },
+    "CpuPercent": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Current CPU usage as a percentage of one core. May exceed 100 on multi-core if implementation reports aggregate."
+    },
+    "MemoryBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Resident/working set memory in bytes."
+    },
+    "MemoryPercent": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Memory usage as percentage of total system RAM."
+    },
+    "Status": {
+      "type": "string",
+      "enum": ["Running", "Sleeping", "Stopped", "Zombie", "Idle", "Unknown"],
+      "description": "Normalized process state."
+    },
+    "User": {
+      "type": ["string", "null"],
+      "description": "Username that owns the process.",
+      "examples": ["root", "SYSTEM", "chris", "www-data"]
+    },
+    "StartTime": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when the process started."
+    },
+    "CommandLine": {
+      "type": ["string", "null"],
+      "description": "Full command line that launched the process, if available."
+    },
+    "ThreadCount": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Number of threads owned by this process."
+    }
+  },
+  "additionalProperties": false
+}

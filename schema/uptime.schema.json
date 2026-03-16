@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universalmachine.dev/schema/uptime/v1",
+  "title": "UMI Uptime Object",
+  "description": "Universal Machine Interface schema for system uptime and basic identity.",
+  "type": "object",
+  "required": ["Hostname", "OS", "OSVersion", "Architecture", "BootTime", "UptimeSeconds"],
+  "properties": {
+    "Hostname": {
+      "type": "string",
+      "description": "Machine hostname.",
+      "examples": ["workstation-01", "prod-web-3"]
+    },
+    "OS": {
+      "type": "string",
+      "enum": ["Windows", "Linux", "macOS"],
+      "description": "Normalized operating system family."
+    },
+    "OSVersion": {
+      "type": "string",
+      "description": "OS-specific version string.",
+      "examples": ["10.0.22631", "Ubuntu 24.04", "14.5"]
+    },
+    "Architecture": {
+      "type": "string",
+      "enum": ["x64", "ARM64", "x86", "ARM"],
+      "description": "Normalized CPU architecture."
+    },
+    "BootTime": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of last boot."
+    },
+    "UptimeSeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Seconds since last boot. Agents: divide by 86400 for days."
+    },
+    "UptimeHuman": {
+      "type": "string",
+      "description": "Human-friendly uptime string.",
+      "examples": ["3d 14h 22m", "0d 2h 5m"]
+    },
+    "CpuCount": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Number of logical CPU cores."
+    },
+    "TotalMemoryBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total installed RAM in bytes."
+    },
+    "PowerShellVersion": {
+      "type": ["string", "null"],
+      "description": "PowerShell version if running inside PS, null otherwise.",
+      "examples": ["7.4.1"]
+    }
+  },
+  "additionalProperties": false
+}
