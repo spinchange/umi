@@ -31,10 +31,16 @@ function Get-UmiProcess {
 
     if ($IsWindows) {
         try {
-            $procs = Get-Process -ErrorAction Stop
+            $procs = try {
+                Get-Process -IncludeUserName -ErrorAction Stop
+            } catch {
+                Get-Process -ErrorAction Stop
+            }
             $totalMem = (Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize * 1024  # bytes
 
             foreach ($p in $procs) {
+                $startTime = try { $p.StartTime.ToString('o') } catch { $null }
+
                 $results += [PSCustomObject]@{
                     PSTypeName      = 'UMI.Process'
                     ProcessName     = $p.ProcessName
@@ -44,29 +50,31 @@ function Get-UmiProcess {
                     MemoryBytes     = [long]$p.WorkingSet64
                     MemoryPercent   = if ($totalMem -gt 0) { [Math]::Round(($p.WorkingSet64 / $totalMem) * 100, 1) } else { $null }
                     Status          = if ($p.Responding) { 'Running' } else { 'Unknown' }
-                    User            = $null  # Requires elevated CIM, populated below if possible
-                    StartTime       = try { $p.StartTime.ToString('o') } catch { $null }
+                    User            = if ($p.PSObject.Properties['UserName']) { $p.UserName } else { $null }
+                    StartTime       = $startTime
                     CommandLine     = $null
                     ThreadCount     = $p.Threads.Count
                 }
             }
 
-            # Attempt to fill User and CommandLine from CIM (may require elevation)
+            # Attempt to fill ParentProcessId and CommandLine from CIM.
             try {
-                $cimProcs = Get-CimInstance Win32_Process -Property ProcessId, CommandLine -ErrorAction Stop
-                $ownerCache = @{}
+                $cimProcs = Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CommandLine -ErrorAction Stop
+                $cimCache = @{}
                 foreach ($cp in $cimProcs) {
-                    $owner = try { (Invoke-CimMethod -InputObject $cp -MethodName GetOwner -ErrorAction Stop).User } catch { $null }
-                    $ownerCache[$cp.ProcessId] = @{ User = $owner; Cmd = $cp.CommandLine }
+                    $cimCache[$cp.ProcessId] = @{
+                        Cmd  = $cp.CommandLine
+                        Ppid = $cp.ParentProcessId
+                    }
                 }
                 foreach ($r in $results) {
-                    if ($ownerCache.ContainsKey($r.ProcessId)) {
-                        $r.User = $ownerCache[$r.ProcessId].User
-                        $r.CommandLine = $ownerCache[$r.ProcessId].Cmd
+                    if ($cimCache.ContainsKey($r.ProcessId)) {
+                        $r.CommandLine = $cimCache[$r.ProcessId].Cmd
+                        $r.ParentProcessId = $cimCache[$r.ProcessId].Ppid
                     }
                 }
             } catch {
-                # Non-elevated: User and CommandLine stay null — that's fine
+                # Non-elevated: ParentProcessId and CommandLine stay null — that's fine
             }
         } catch {
             Write-Error "Get-UmiProcess [Windows]: $_"
@@ -111,11 +119,23 @@ function Get-UmiProcess {
                 $memBytes = if ($totalMem -and $memPct -gt 0) {
                     [long]($totalMem * $memPct / 100)
                 } else { [long]0 }
+                $pid = [int]$parts[0]
+                $threadCount = $null
+
+                if ($IsLinux) {
+                    $procStatus = Get-Content "/proc/$pid/status" -ErrorAction SilentlyContinue
+                    foreach ($statusLine in $procStatus) {
+                        if ($statusLine -match '^Threads:\s+(\d+)') {
+                            $threadCount = [int]$Matches[1]
+                            break
+                        }
+                    }
+                }
 
                 $results += [PSCustomObject]@{
                     PSTypeName      = 'UMI.Process'
                     ProcessName     = $parts[6] -replace '.*/(.+)$', '$1'  # strip path
-                    ProcessId       = [int]$parts[0]
+                    ProcessId       = $pid
                     ParentProcessId = [int]$parts[1]
                     CpuPercent      = $cpuPct
                     MemoryBytes     = $memBytes
@@ -124,7 +144,7 @@ function Get-UmiProcess {
                     User            = $parts[2]
                     StartTime       = $null  # lstart parsing is complex; omitted for v0.1
                     CommandLine     = $parts[6]
-                    ThreadCount     = $null
+                    ThreadCount     = $threadCount
                 }
             }
         } catch {

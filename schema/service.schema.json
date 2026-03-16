@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universalmachine.dev/schema/service/v1",
+  "title": "UMI Service Object",
+  "description": "Universal Machine Interface schema for system services (systemd, launchd, Windows Services).",
+  "type": "object",
+  "required": ["ServiceName", "DisplayName", "Status", "StartType"],
+  "properties": {
+    "ServiceName": {
+      "type": "string",
+      "description": "Unique identifier for the service. For Windows, the short name (e.g., 'WinDefend'). For systemd, the unit name without '.service' (e.g., 'sshd'). For launchd, the label (e.g., 'com.apple.coreservices.uiagent').",
+      "examples": ["sshd", "WinDefend", "com.nginx.nginx"]
+    },
+    "DisplayName": {
+      "type": ["string", "null"],
+      "description": "Human-friendly name of the service.",
+      "examples": ["SSH Daemon", "Microsoft Defender Antivirus Service"]
+    },
+    "Description": {
+      "type": ["string", "null"],
+      "description": "Detailed description of the service's purpose or vendor info."
+    },
+    "Status": {
+      "type": "string",
+      "enum": ["Running", "Stopped", "Paused", "Starting", "Stopping", "Degraded", "Unknown"],
+      "description": "Current operational state. Degraded refers to a service that is active but in a failed or limited state (like systemd 'failed' or 'degraded')."
+    },
+    "StartType": {
+      "type": "string",
+      "enum": ["Automatic", "Manual", "Disabled", "Delayed", "OnDemand", "Unknown"],
+      "description": "Configuration for how the service starts. OnDemand refers to socket-activated or dependency-triggered services."
+    },
+    "User": {
+      "type": ["string", "null"],
+      "description": "Account context the service runs as.",
+      "examples": ["LocalSystem", "root", "www-data"]
+    },
+    "ProcessId": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "PID of the main process if currently active."
+    },
+    "BinaryPath": {
+      "type": ["string", "null"],
+      "description": "Command line or path to the executable that launches the service.",
+      "examples": ["C:\\Windows\\System32\\svchost.exe -k LocalService", "/usr/sbin/sshd -D"]
+    },
+    "UptimeSeconds": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Seconds the service has been running since the last start."
+    },
+    "ExitCode": {
+      "type": ["integer", "null"],
+      "description": "Last exit code reported by the service when it stopped or failed."
+    }
+  },
+  "additionalProperties": false
+}

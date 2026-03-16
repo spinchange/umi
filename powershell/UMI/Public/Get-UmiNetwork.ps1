@@ -84,6 +84,17 @@ function Get-UmiNetwork {
         try {
             if ($IsLinux -and (Get-Command ip -ErrorAction SilentlyContinue)) {
                 $ipJson = & ip -j addr 2>/dev/null | ConvertFrom-Json
+                $dnsServers = @()
+                $resolvConf = Get-Content /etc/resolv.conf -ErrorAction SilentlyContinue
+                foreach ($line in $resolvConf) {
+                    if ($line -match '^\s*nameserver\s+(\S+)') {
+                        $server = $Matches[1]
+                        if ($server -and $dnsServers -notcontains $server) {
+                            $dnsServers += $server
+                        }
+                    }
+                }
+
                 foreach ($iface in $ipJson) {
                     $status = if ($iface.operstate -eq 'UP' -or $iface.flags -contains 'UP') { 'Up' } else { 'Down' }
                     if (-not $All -and $status -ne 'Up') { continue }
@@ -122,7 +133,7 @@ function Get-UmiNetwork {
                         DefaultGateway = $null  # Requires separate 'ip route' call
                         MacAddress     = $mac
                         SpeedMbps      = $null
-                        DnsServers     = @()
+                        DnsServers     = @($dnsServers)
                     }
                 }
 
@@ -138,6 +149,28 @@ function Get-UmiNetwork {
                 $raw = & ifconfig 2>/dev/null
                 $currentIface = $null
                 $ifaceBlocks = @{}
+                $defaultGateway = $null
+                $dnsServers = @()
+
+                if ($IsMacOS) {
+                    $routeLine = & netstat -rn 2>/dev/null | Where-Object { $_ -match '^(default|0\.0\.0\.0)\s+' } | Select-Object -First 1
+                    if ($routeLine) {
+                        $routeParts = $routeLine -split '\s+'
+                        if ($routeParts.Count -gt 1) {
+                            $defaultGateway = $routeParts[1]
+                        }
+                    }
+
+                    $scutilOutput = & scutil --dns 2>/dev/null
+                    foreach ($line in $scutilOutput) {
+                        if ($line -match 'nameserver\[\d+\]\s*:\s*(\S+)') {
+                            $server = $Matches[1]
+                            if ($server -and $dnsServers -notcontains $server) {
+                                $dnsServers += $server
+                            }
+                        }
+                    }
+                }
 
                 foreach ($line in $raw -split "`n") {
                     if ($line -match '^(\S+):') {
@@ -180,10 +213,10 @@ function Get-UmiNetwork {
                         IPv4Address    = $ipv4
                         IPv6Address    = $null
                         SubnetMask     = $mask
-                        DefaultGateway = $null
+                        DefaultGateway = $defaultGateway
                         MacAddress     = $mac
                         SpeedMbps      = $null
-                        DnsServers     = @()
+                        DnsServers     = @($dnsServers)
                     }
                 }
             }

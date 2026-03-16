@@ -20,3 +20,5 @@ dist/
 # Test output
 TestResults/
 *.nupkg
+mcp-server/umi_mcp/__pycache__/
+mcp-server/umi_mcp/tools/__pycache__/

@@ -82,6 +82,69 @@ function Get-UmiUser {
     else {
         # Linux and macOS — parse /etc/passwd
         try {
+            function Get-LastLoginTimestamp {
+                param(
+                    [Parameter(Mandatory)]
+                    [string]$Username
+                )
+
+                $lastLine = & last -1 $Username 2>/dev/null | Select-Object -First 1
+                if (-not $lastLine -or $lastLine -match 'wtmp begins') {
+                    return $null
+                }
+
+                $dateMatch = [regex]::Match(
+                    $lastLine,
+                    '(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}(?::\d{2})?(?:\s+\d{4})?'
+                )
+                if (-not $dateMatch.Success) {
+                    return $null
+                }
+
+                $dateText = $dateMatch.Value
+                $hasYear = $dateText -match '\s\d{4}$'
+                $formats = if ($hasYear) {
+                    @(
+                        'ddd MMM d HH:mm:ss yyyy',
+                        'ddd MMM dd HH:mm:ss yyyy',
+                        'ddd MMM d HH:mm yyyy',
+                        'ddd MMM dd HH:mm yyyy'
+                    )
+                }
+                else {
+                    @(
+                        'ddd MMM d HH:mm:ss',
+                        'ddd MMM dd HH:mm:ss',
+                        'ddd MMM d HH:mm',
+                        'ddd MMM dd HH:mm'
+                    )
+                }
+
+                foreach ($format in $formats) {
+                    try {
+                        $parsed = [datetime]::ParseExact(
+                            $dateText,
+                            $format,
+                            [System.Globalization.CultureInfo]::InvariantCulture,
+                            [System.Globalization.DateTimeStyles]::AssumeLocal
+                        )
+
+                        if (-not $hasYear) {
+                            $parsed = Get-Date -Year (Get-Date).Year -Month $parsed.Month -Day $parsed.Day -Hour $parsed.Hour -Minute $parsed.Minute -Second $parsed.Second
+                            if ($parsed -gt (Get-Date).AddDays(1)) {
+                                $parsed = $parsed.AddYears(-1)
+                            }
+                        }
+
+                        return $parsed.ToString('o')
+                    } catch {
+                        continue
+                    }
+                }
+
+                return $null
+            }
+
             $passwdLines = Get-Content /etc/passwd -ErrorAction Stop
             $currentUid = & id -u 2>/dev/null
 
@@ -93,7 +156,7 @@ function Get-UmiUser {
                 $uid      = [int]$parts[2]
                 $gid      = [int]$parts[3]
                 $fullName = if ([string]::IsNullOrWhiteSpace($parts[4]) -or $parts[4] -eq $username) { $null } else { ($parts[4] -split ',')[0] }
-                $home     = $parts[5]
+                $homeDirectory = $parts[5]
                 $shell    = $parts[6]
 
                 # Skip system accounts (UID < 1000 on Linux, < 500 on macOS) unless root
@@ -120,13 +183,13 @@ function Get-UmiUser {
                     Username      = $username
                     UserId        = $uid
                     FullName      = $fullName
-                    HomeDirectory = $home
+                    HomeDirectory = $homeDirectory
                     Shell         = $shell
                     IsCurrentUser = $isCurrent
                     IsAdmin       = $isAdmin
                     IsEnabled     = (-not ($shell -match 'nologin|false'))
                     Groups        = $groups
-                    LastLogin     = $null
+                    LastLogin     = Get-LastLoginTimestamp -Username $username
                 }
             }
         } catch {

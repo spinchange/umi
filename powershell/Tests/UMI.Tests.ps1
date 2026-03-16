@@ -3,6 +3,41 @@
 
 BeforeAll {
     Import-Module (Join-Path $PSScriptRoot '..' 'UMI' 'UMI.psd1') -Force
+
+    function Invoke-UmiSourceOnPlatform {
+        param(
+            [Parameter(Mandatory)]
+            [string]$ScriptName,
+            [Parameter(Mandatory)]
+            [ValidateSet('Windows', 'Linux', 'macOS')]
+            [string]$Platform,
+            [string]$Prelude = '',
+            [Parameter(Mandatory)]
+            [string]$Invocation
+        )
+
+        $scriptPath = Join-Path $PSScriptRoot '..' 'UMI' 'Public' $ScriptName
+        $source = Get-Content $scriptPath -Raw
+        $source = $source.Replace('$IsWindows', '$__umiIsWindows')
+        $source = $source.Replace('$IsLinux', '$__umiIsLinux')
+        $source = $source.Replace('$IsMacOS', '$__umiIsMacOS')
+        $source = $source.Replace('2>/dev/null', '')
+        $source = $source.Replace('& ps ', '& __umi_ps ')
+        $platformSetup = switch ($Platform) {
+            'Windows' { '$__umiIsWindows = $true; $__umiIsLinux = $false; $__umiIsMacOS = $false' }
+            'Linux'   { '$__umiIsWindows = $false; $__umiIsLinux = $true; $__umiIsMacOS = $false' }
+            'macOS'   { '$__umiIsWindows = $false; $__umiIsLinux = $false; $__umiIsMacOS = $true' }
+        }
+
+        $script = @"
+$platformSetup
+$Prelude
+$source
+$Invocation
+"@
+
+        & ([scriptblock]::Create($script))
+    }
 }
 
 Describe 'Get-UmiDisk' {
@@ -66,6 +101,76 @@ Describe 'Get-UmiNetwork' {
             }
         }
     }
+
+    It 'Parses Linux DNS servers from resolv.conf' {
+        $prelude = @'
+function Get-Command {
+    [CmdletBinding()]
+    param([string]$Name)
+    if ($Name -eq 'ip') { return [pscustomobject]@{ Name = 'ip' } }
+    Microsoft.PowerShell.Core\Get-Command @PSBoundParameters
+}
+function ip {
+    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+    if ($Args[0] -eq '-j' -and $Args[1] -eq 'addr') {
+        return '[{"ifname":"eth0","operstate":"UP","flags":["UP"],"addr_info":[{"family":"inet","local":"192.168.1.10","prefixlen":24}],"address":"aa:bb:cc:dd:ee:ff"}]'
+    }
+    if ($Args[0] -eq '-j' -and $Args[1] -eq 'route') {
+        return '[{"dev":"eth0","gateway":"192.168.1.1"}]'
+    }
+}
+function Get-Content {
+    [CmdletBinding()]
+    param([string]$Path)
+    if ($Path -eq '/etc/resolv.conf') {
+        return @(
+            'nameserver 1.1.1.1',
+            'search example.test',
+            'nameserver 8.8.8.8'
+        )
+    }
+    Microsoft.PowerShell.Management\Get-Content @PSBoundParameters
+}
+'@
+
+        $net = Invoke-UmiSourceOnPlatform -ScriptName 'Get-UmiNetwork.ps1' -Platform 'Linux' -Prelude $prelude -Invocation 'Get-UmiNetwork -All | Select-Object -First 1'
+        $net.DnsServers | Should -Be @('1.1.1.1', '8.8.8.8')
+    }
+
+    It 'Parses macOS fallback gateway and DNS servers' {
+        $prelude = @'
+function ifconfig {
+    @"
+en0: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+    inet 10.0.0.5 netmask 0xffffff00 broadcast 10.0.0.255
+    ether aa:bb:cc:dd:ee:ff
+    status: active
+"@
+}
+function netstat {
+    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+    @(
+        'Routing tables',
+        '',
+        'Internet:',
+        'default            10.0.0.1           UGSc           en0'
+    )
+}
+function scutil {
+    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+    @(
+        'DNS configuration',
+        'resolver #1',
+        '  nameserver[0] : 9.9.9.9',
+        '  nameserver[1] : 8.8.4.4'
+    )
+}
+'@
+
+        $net = Invoke-UmiSourceOnPlatform -ScriptName 'Get-UmiNetwork.ps1' -Platform 'macOS' -Prelude $prelude -Invocation 'Get-UmiNetwork -All | Select-Object -First 1'
+        $net.DefaultGateway | Should -Be '10.0.0.1'
+        $net.DnsServers | Should -Be @('9.9.9.9', '8.8.4.4')
+    }
 }
 
 Describe 'Get-UmiProcess' {
@@ -99,6 +204,54 @@ Describe 'Get-UmiProcess' {
         foreach ($p in $procs) {
             $p.ProcessId | Should -BeGreaterOrEqual 0
         }
+    }
+
+    It 'Parses Linux thread count from /proc status' {
+        $prelude = @'
+function __umi_ps {
+    '123 1 root 12.5 1.0 S /usr/bin/testproc /usr/bin/testproc --flag'
+}
+function Get-Content {
+    [CmdletBinding()]
+    param([string]$Path)
+    if ($Path -eq '/proc/meminfo') { return 'MemTotal:       1024000 kB' }
+    if ($Path -eq '/proc/123/status') { return @('Name: testproc', 'Threads: 7') }
+    Microsoft.PowerShell.Management\Get-Content @PSBoundParameters
+}
+'@
+
+        $proc = Invoke-UmiSourceOnPlatform -ScriptName 'Get-UmiProcess.ps1' -Platform 'Linux' -Prelude $prelude -Invocation 'Get-UmiProcess | Select-Object -First 1'
+        $proc.ThreadCount | Should -Be 7
+    }
+
+    It 'Parses Windows parent PID from CIM' {
+        $prelude = @'
+function Get-Process {
+    [CmdletBinding()]
+    param([switch]$IncludeUserName)
+    [pscustomobject]@{
+        ProcessName  = 'pwsh'
+        Id           = 42
+        CPU          = 5.1
+        WorkingSet64 = 1048576
+        Responding   = $true
+        StartTime    = [datetime]'2026-03-16T10:00:00'
+        Threads      = @(1, 2, 3)
+        UserName     = 'alice'
+    }
+}
+function Get-CimInstance {
+    [CmdletBinding()]
+    param([string]$ClassName, [string[]]$Property)
+    switch ($ClassName) {
+        'Win32_OperatingSystem' { [pscustomobject]@{ TotalVisibleMemorySize = 2048 } }
+        'Win32_Process' { [pscustomobject]@{ ProcessId = 42; ParentProcessId = 24; CommandLine = 'pwsh -NoProfile' } }
+    }
+}
+'@
+
+        $proc = Invoke-UmiSourceOnPlatform -ScriptName 'Get-UmiProcess.ps1' -Platform 'Windows' -Prelude $prelude -Invocation 'Get-UmiProcess | Select-Object -First 1'
+        $proc.ParentProcessId | Should -Be 24
     }
 }
 
@@ -153,6 +306,52 @@ Describe 'Get-UmiUser' {
         if ($me.HomeDirectory) {
             Test-Path $me.HomeDirectory | Should -Be $true
         }
+    }
+
+    It 'Parses Linux last login timestamps' {
+        $prelude = @'
+function Get-Content {
+    [CmdletBinding()]
+    param([string]$Path)
+    if ($Path -eq '/etc/passwd') { return 'alice:x:1000:1000:Alice Example:/home/alice:/bin/bash' }
+    Microsoft.PowerShell.Management\Get-Content @PSBoundParameters
+}
+function id {
+    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+    if ($Args[0] -eq '-u') { return '1000' }
+    if ($Args[0] -eq '-Gn') { return 'sudo users' }
+}
+function last {
+    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+    'alice pts/0 10.0.0.5 Mon Mar 15 08:30 - 09:30 (01:00)'
+}
+'@
+
+        $user = Invoke-UmiSourceOnPlatform -ScriptName 'Get-UmiUser.ps1' -Platform 'Linux' -Prelude $prelude -Invocation 'Get-UmiUser -Current | Select-Object -First 1'
+        ([datetimeoffset]$user.LastLogin).ToString('yyyy-MM-ddTHH:mm:ss') | Should -Be '2026-03-15T08:30:00'
+    }
+
+    It 'Parses macOS last login timestamps' {
+        $prelude = @'
+function Get-Content {
+    [CmdletBinding()]
+    param([string]$Path)
+    if ($Path -eq '/etc/passwd') { return 'alice:x:501:20:Alice Example:/Users/alice:/bin/zsh' }
+    Microsoft.PowerShell.Management\Get-Content @PSBoundParameters
+}
+function id {
+    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+    if ($Args[0] -eq '-u') { return '501' }
+    if ($Args[0] -eq '-Gn') { return 'staff admin' }
+}
+function last {
+    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+    'alice console Mon Mar 15 08:30   still logged in'
+}
+'@
+
+        $user = Invoke-UmiSourceOnPlatform -ScriptName 'Get-UmiUser.ps1' -Platform 'macOS' -Prelude $prelude -Invocation 'Get-UmiUser -Current | Select-Object -First 1'
+        ([datetimeoffset]$user.LastLogin).ToString('yyyy-MM-ddTHH:mm:ss') | Should -Be '2026-03-15T08:30:00'
     }
 }
 
