@@ -26,6 +26,7 @@ def _classify_interface(name: str) -> str:
 def get_network(include_down: bool = False) -> list[dict]:
     addrs = psutil.net_if_addrs()
     stats = psutil.net_if_stats()
+    io_counters = psutil.net_io_counters(pernic=True)
     results = []
 
     for iface_name, addr_list in addrs.items():
@@ -56,6 +57,8 @@ def get_network(include_down: bool = False) -> list[dict]:
                 if raw and raw not in ("00:00:00:00:00:00", ""):
                     mac = raw
 
+        io = io_counters.get(iface_name)
+
         results.append({
             "InterfaceName": iface_name,
             "InterfaceType": _classify_interface(iface_name),
@@ -67,6 +70,14 @@ def get_network(include_down: bool = False) -> list[dict]:
             "MacAddress": mac,
             "SpeedMbps": stat.speed if stat and stat.speed > 0 else None,
             "DnsServers": [],
+            "BytesSent": io.bytes_sent if io else None,
+            "BytesRecv": io.bytes_recv if io else None,
+            "PacketsSent": io.packets_sent if io else None,
+            "PacketsRecv": io.packets_recv if io else None,
+            "ErrorsIn": io.errin if io else None,
+            "ErrorsOut": io.errout if io else None,
+            "DropsIn": io.dropin if io else None,
+            "DropsOut": io.dropout if io else None,
         })
 
     return results

@@ -36,6 +36,11 @@ def get_uptime() -> dict:
         except ImportError:
             os_version = platform.release()
 
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    cpu_percent = psutil.cpu_percent(interval=0.5)
+    load_avg = psutil.getloadavg() if hasattr(psutil, "getloadavg") else None
+
     return {
         "Hostname": socket.gethostname(),
         "OS": OS_MAP.get(os_name, os_name),
@@ -45,6 +50,14 @@ def get_uptime() -> dict:
         "UptimeSeconds": uptime_secs,
         "UptimeHuman": f"{days}d {hours}h {minutes}m",
         "CpuCount": psutil.cpu_count(logical=True),
-        "TotalMemoryBytes": psutil.virtual_memory().total,
+        "TotalMemoryBytes": mem.total,
+        "CpuPercentOverall": round(cpu_percent, 1),
+        "MemoryUsedBytes": mem.used,
+        "MemoryAvailableBytes": mem.available,
+        "SwapTotalBytes": swap.total,
+        "SwapUsedBytes": swap.used,
+        "LoadAverage1m": round(load_avg[0], 2) if load_avg else None,
+        "LoadAverage5m": round(load_avg[1], 2) if load_avg else None,
+        "LoadAverage15m": round(load_avg[2], 2) if load_avg else None,
         "PowerShellVersion": None,
     }
