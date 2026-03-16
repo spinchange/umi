@@ -192,6 +192,23 @@ pytest mcp-server/tests/ --cov=umi_mcp --cov-report=term-missing
 
 ---
 
+## Known Limitations
+
+### Windows: virtual/cloud-mounted drives may report identical disk stats
+
+On Windows, virtual drives (e.g. Google Drive, OneDrive, network shares) are
+sometimes backed by the same underlying volume. When this happens,
+`get_umi_disk` may return two entries with identical `TotalBytes`, `UsedBytes`,
+and `FreeBytes`. This is a Windows API limitation — `psutil` sees the same
+physical volume through two mount points. I/O counters for virtual drives will
+also be `null` for the same reason.
+
+A future fix will add a `VolumeSerial` or `DeviceId` field to allow callers to
+detect and deduplicate aliased volumes. Tracked in
+[#fix/disk-virtual-drive-disambiguation](https://github.com/spinchange/umi/issues).
+
+---
+
 ## Contributing
 
 The most useful contributions right now:
