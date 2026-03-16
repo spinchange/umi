@@ -1,4 +1,5 @@
 import json
+import runpy
 import unittest
 import socket
 import psutil
@@ -1139,6 +1140,23 @@ class UserAdditionalEdgeCaseTests(unittest.TestCase):
         result = self._run_unix(mock_pwd, mock_grp)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["Groups"], [])
+
+
+class MainEntryPointTests(unittest.TestCase):
+    @patch("umi_mcp.__main__.mcp.run")
+    def test_main_calls_mcp_run(self, mock_run):
+        from umi_mcp.__main__ import main
+        main()
+        mock_run.assert_called_once_with()
+
+    def test_module_dunder_main_calls_main(self):
+        # runpy re-executes the module in a fresh namespace, so we can't patch
+        # the name 'main' there — instead patch mcp.run on the shared server
+        # object (imported from the already-cached umi_mcp.server module).
+        sys.modules.pop("umi_mcp.__main__", None)
+        with patch("umi_mcp.server.mcp.run") as mock_run:
+            runpy.run_module("umi_mcp", run_name="__main__", alter_sys=True)
+        mock_run.assert_called_once_with()
 
 
 if __name__ == "__main__":
