@@ -805,5 +805,329 @@ class EventsToolExtendedTests(unittest.TestCase):
         self.assertEqual(res_src[0]["Source"], "com.apple.a")
 
 
+class DiskHelpersTests(unittest.TestCase):
+    # _normalize_windows_drive
+    def test_normalize_windows_drive_falsy_returns_none(self):
+        self.assertIsNone(disk._normalize_windows_drive(None))
+        self.assertIsNone(disk._normalize_windows_drive(""))
+
+    def test_normalize_windows_drive_non_drive_format_returns_none(self):
+        self.assertIsNone(disk._normalize_windows_drive("notadrive"))
+        self.assertIsNone(disk._normalize_windows_drive("/dev/sda1"))
+
+    def test_normalize_windows_drive_valid_formats(self):
+        self.assertEqual(disk._normalize_windows_drive("C:\\"), "C:\\")
+        self.assertEqual(disk._normalize_windows_drive("D:\\path\\to\\dir"), "D:\\")
+
+    # _load_windows_drive_map error paths
+    @patch("umi_mcp.tools.disk.subprocess.run", side_effect=OSError("no powershell"))
+    def test_load_windows_drive_map_oserror_returns_empty(self, _):
+        self.assertEqual(disk._load_windows_drive_map(), {})
+
+    @patch("umi_mcp.tools.disk.subprocess.run")
+    def test_load_windows_drive_map_bad_returncode_returns_empty(self, mock_run):
+        mock_run.return_value = SimpleNamespace(returncode=1, stdout="")
+        self.assertEqual(disk._load_windows_drive_map(), {})
+
+    @patch("umi_mcp.tools.disk.subprocess.run")
+    def test_load_windows_drive_map_bad_json_returns_empty(self, mock_run):
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="not json {{")
+        self.assertEqual(disk._load_windows_drive_map(), {})
+
+    @patch("umi_mcp.tools.disk.subprocess.run")
+    def test_load_windows_drive_map_single_dict_response(self, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"DriveLetter": "C", "DiskNumber": 0}),
+        )
+        self.assertEqual(disk._load_windows_drive_map(), {"C:\\": "PhysicalDrive0"})
+
+    @patch("umi_mcp.tools.disk.subprocess.run")
+    def test_load_windows_drive_map_missing_fields_skipped(self, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([
+                {"DriveLetter": None, "DiskNumber": 0},
+                {"DriveLetter": "D", "DiskNumber": 1},
+            ]),
+        )
+        self.assertEqual(disk._load_windows_drive_map(), {"D:\\": "PhysicalDrive1"})
+
+    # _device_candidates
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
+    def test_device_candidates_dev_prefix_stripped(self, _):
+        result = disk._device_candidates("/dev/sda1", None)
+        self.assertIn("sda1", result)
+        self.assertIn("sda", result)
+
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
+    def test_device_candidates_nvme_parent_added(self, _):
+        result = disk._device_candidates("/dev/nvme0n1p1", None)
+        self.assertIn("nvme0n1p1", result)
+        self.assertIn("nvme0n1", result)
+
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
+    def test_device_candidates_mmcblk_parent_added(self, _):
+        result = disk._device_candidates("/dev/mmcblk0p1", None)
+        self.assertIn("mmcblk0p1", result)
+        self.assertIn("mmcblk0", result)
+
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Windows")
+    def test_device_candidates_windows_normalizes_drive(self, _):
+        result = disk._device_candidates("C:\\", "C:\\")
+        self.assertEqual(result, ["C:\\"])
+
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
+    def test_device_candidates_falsy_raw_skipped(self, _):
+        self.assertEqual(disk._device_candidates(None, None), [])
+
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
+    @patch("umi_mcp.tools.disk.os.path.basename", return_value="")
+    def test_device_candidates_basename_empty_falls_back_to_raw_and_strips_dev_prefix(self, _, __):
+        # basename returns "" → base = raw.rstrip("/") = "/dev/sda1" → stripped to "sda1"
+        result = disk._device_candidates("/dev/sda1", None)
+        self.assertIn("sda1", result)
+
+    # get_disk pseudo mountpoint filter (PSEUDO_MOUNTS)
+    @patch("umi_mcp.tools.disk.psutil.disk_io_counters", return_value={})
+    @patch("umi_mcp.tools.disk.psutil.disk_usage")
+    @patch("umi_mcp.tools.disk.psutil.disk_partitions")
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
+    def test_get_disk_filters_pseudo_mount_points(self, _, mock_parts, mock_usage, __):
+        mock_parts.return_value = [
+            SimpleNamespace(device="nfsd", mountpoint="/proc/fs/nfsd", fstype="nfsd"),
+            SimpleNamespace(device="/dev/sda1", mountpoint="/", fstype="ext4"),
+        ]
+        mock_usage.return_value = SimpleNamespace(total=1000, used=100, free=900)
+        result = disk.get_disk()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["MountPoint"], "/")
+
+
+class NetworkHelpersTests(unittest.TestCase):
+    def test_prefix_to_mask(self):
+        self.assertEqual(network._prefix_to_mask(8), "255.0.0.0")
+        self.assertEqual(network._prefix_to_mask(16), "255.255.0.0")
+        self.assertEqual(network._prefix_to_mask(24), "255.255.255.0")
+
+    def test_classify_interface_tunnel(self):
+        for name in ("tun0", "tap1", "vpn0"):
+            self.assertEqual(network._classify_interface(name), "Tunnel", name)
+
+    def test_classify_interface_virtual(self):
+        for name in ("docker0", "veth0abc", "br-abc123", "virbr0", "vbox0"):
+            self.assertEqual(network._classify_interface(name), "Virtual", name)
+
+    def test_classify_interface_unknown(self):
+        self.assertEqual(network._classify_interface("zzz999"), "Unknown")
+
+    @patch("umi_mcp.tools.network.psutil.net_io_counters", return_value={})
+    @patch("umi_mcp.tools.network.psutil.net_if_stats")
+    @patch("umi_mcp.tools.network.psutil.net_if_addrs")
+    def test_subnet_mask_derived_from_prefixlen(self, mock_addrs, mock_stats, _):
+        mock_addrs.return_value = {
+            "eth0": [SimpleNamespace(
+                family=socket.AF_INET, address="10.0.0.1",
+                netmask=None, prefixlen=24,
+            )]
+        }
+        mock_stats.return_value = {"eth0": SimpleNamespace(isup=True, speed=1000)}
+        result = network.get_network()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["SubnetMask"], "255.255.255.0")
+
+
+class ProcessEdgeCaseTests(unittest.TestCase):
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    @patch("umi_mcp.tools.process.psutil.cpu_percent")
+    def test_nameless_process_is_skipped(self, _, mock_iter):
+        mock_iter.return_value = [
+            MagicMock(info={
+                "pid": 1, "name": None, "ppid": 0, "cpu_percent": 5.0,
+                "memory_info": None, "memory_percent": None,
+                "status": psutil.STATUS_RUNNING, "username": "root",
+                "create_time": 1.0, "cmdline": [], "num_threads": 1,
+            }),
+            MagicMock(info={
+                "pid": 2, "name": "real_proc", "ppid": 1, "cpu_percent": 1.0,
+                "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
+                "status": psutil.STATUS_RUNNING, "username": "user",
+                "create_time": 1.0, "cmdline": ["real"], "num_threads": 1,
+            }),
+        ]
+        result = process.get_process()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ProcessName"], "real_proc")
+
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    @patch("umi_mcp.tools.process.psutil.cpu_percent")
+    def test_create_time_overflow_produces_null_start_time(self, _, mock_iter):
+        mock_iter.return_value = [
+            MagicMock(info={
+                "pid": 1, "name": "proc", "ppid": 0, "cpu_percent": 0.0,
+                "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
+                "status": psutil.STATUS_RUNNING, "username": "user",
+                "create_time": 1e300,
+                "cmdline": None, "num_threads": 1,
+            }),
+        ]
+        result = process.get_process()
+        self.assertEqual(len(result), 1)
+        self.assertIsNone(result[0]["StartTime"])
+        self.assertIsNone(result[0]["CommandLine"])
+
+
+class ServiceAdditionalEdgeCaseTests(unittest.TestCase):
+    @patch("umi_mcp.tools.service.platform.system", return_value="FreeBSD")
+    def test_unknown_platform_returns_empty(self, _):
+        self.assertEqual(service.get_service(), [])
+
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Windows")
+    def test_windows_single_dict_response_not_list(self, _, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"Name": "OnlyOne", "State": "Running", "StartMode": "Auto"}),
+        )
+        result = service.get_service()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ServiceName"], "OnlyOne")
+
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Windows")
+    def test_windows_name_filter_excludes_non_matching(self, _, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([
+                {"Name": "TargetService", "State": "Running", "StartMode": "Auto"},
+                {"Name": "OtherService", "State": "Running", "StartMode": "Auto"},
+            ]),
+        )
+        result = service.get_service(name="Target")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ServiceName"], "TargetService")
+
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Linux")
+    def test_linux_non_service_units_skipped(self, _, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([
+                {"unit": "ssh.service", "description": "SSH", "active": "active", "sub": "running"},
+                {"unit": "dev-sda.device", "description": "Disk", "active": "active", "sub": "plugged"},
+                {"unit": "network.mount", "description": "Mount", "active": "active", "sub": "mounted"},
+            ]),
+        )
+        result = service.get_service()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ServiceName"], "ssh")
+
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Linux")
+    def test_linux_name_filter_excludes_non_matching(self, _, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([
+                {"unit": "ssh.service", "description": "SSH", "active": "active", "sub": "running"},
+                {"unit": "cron.service", "description": "Cron", "active": "active", "sub": "running"},
+            ]),
+        )
+        result = service.get_service(name="cron")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ServiceName"], "cron")
+
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Darwin")
+    def test_macos_short_line_skipped(self, _, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="pid\tstatus\tlabel\n123\tshortline\n-\t0\tcom.apple.ok",
+        )
+        result = service.get_service()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ServiceName"], "com.apple.ok")
+
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Darwin")
+    def test_macos_name_filter_excludes_non_matching(self, _, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="pid\tstatus\tlabel\n123\t0\tcom.apple.target\n-\t0\tcom.other",
+        )
+        result = service.get_service(name="apple.target")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ServiceName"], "com.apple.target")
+
+    @patch("umi_mcp.tools.service.subprocess.run", side_effect=OSError("unavailable"))
+    @patch("umi_mcp.tools.service.platform.system", return_value="Darwin")
+    def test_macos_exception_returns_empty(self, _, __):
+        self.assertEqual(service.get_service(), [])
+
+
+class UserAdditionalEdgeCaseTests(unittest.TestCase):
+    def _unix_context(self, mock_pwd, mock_grp):
+        """Return a context manager that injects pwd/grp mocks into sys.modules."""
+        return ExitStack()
+
+    def _run_unix(self, mock_pwd, mock_grp, **kwargs):
+        """Call user.get_user() with pwd/grp injected into sys.modules."""
+        with patch.dict(sys.modules, {"pwd": mock_pwd, "grp": mock_grp}):
+            with patch("umi_mcp.tools.user.platform.system", return_value="Linux"):
+                with patch("umi_mcp.tools.user.os.getuid", return_value=1000, create=True):
+                    return user.get_user(**kwargs)
+
+    def test_getpwall_failure_falls_back_to_current_user(self):
+        mock_pwd = MagicMock()
+        mock_grp = MagicMock()
+        current = SimpleNamespace(
+            pw_name="user1", pw_uid=1000, pw_gid=1000,
+            pw_gecos="User One", pw_dir="/home/user1", pw_shell="/bin/bash",
+        )
+        mock_pwd.getpwuid.return_value = current
+        mock_pwd.getpwall.side_effect = Exception("not supported")
+        mock_grp.getgrall.return_value = []
+        mock_grp.getgrgid.return_value = SimpleNamespace(gr_name="user1")
+
+        result = self._run_unix(mock_pwd, mock_grp)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["Username"], "user1")
+
+    def test_low_uid_users_filtered_out(self):
+        mock_pwd = MagicMock()
+        mock_grp = MagicMock()
+        current = SimpleNamespace(
+            pw_name="user1", pw_uid=1000, pw_gid=1000,
+            pw_gecos="", pw_dir="/home/user1", pw_shell="/bin/bash",
+        )
+        daemon = SimpleNamespace(
+            pw_name="daemon", pw_uid=2, pw_gid=2,
+            pw_gecos="", pw_dir="/usr/sbin", pw_shell="/usr/sbin/nologin",
+        )
+        mock_pwd.getpwuid.return_value = current
+        mock_pwd.getpwall.return_value = [daemon, current]
+        mock_grp.getgrall.return_value = []
+        mock_grp.getgrgid.return_value = SimpleNamespace(gr_name="user1")
+
+        result = self._run_unix(mock_pwd, mock_grp)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["Username"], "user1")
+
+    def test_grgid_keyerror_skipped_gracefully(self):
+        mock_pwd = MagicMock()
+        mock_grp = MagicMock()
+        current = SimpleNamespace(
+            pw_name="user1", pw_uid=1000, pw_gid=9999,
+            pw_gecos="", pw_dir="/home/user1", pw_shell="/bin/bash",
+        )
+        mock_pwd.getpwuid.return_value = current
+        mock_pwd.getpwall.return_value = [current]
+        mock_grp.getgrall.return_value = []
+        mock_grp.getgrgid.side_effect = KeyError("9999")
+
+        result = self._run_unix(mock_pwd, mock_grp)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["Groups"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
