@@ -27,6 +27,11 @@ dependencies = [
     "psutil>=5.9.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.urls]
 Homepage = "https://spinchange.github.io/umi"
 Repository = "https://github.com/spinchange/umi"
