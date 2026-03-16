@@ -165,31 +165,36 @@ class NetworkToolTests(unittest.TestCase):
 
 
 class ProcessToolTests(unittest.TestCase):
+    @patch("umi_mcp.tools.process.time.sleep")
     @patch("umi_mcp.tools.process.psutil.process_iter")
-    @patch("umi_mcp.tools.process.psutil.cpu_percent")
-    def test_get_process_filtering_and_top(self, _mock_cpu, mock_iter):
-        mock_iter.return_value = [
-            MagicMock(info={
-                "pid": 101, "name": "python.exe", "ppid": 100, "cpu_percent": 5.0,
-                "memory_info": SimpleNamespace(rss=1024), "memory_percent": 1.0,
-                "status": psutil.STATUS_RUNNING, "username": "user1",
-                "create_time": 1710590400.0, "cmdline": ["python", "app.py"], "num_threads": 2
-            }),
-            MagicMock(info={
-                "pid": 102, "name": "chrome.exe", "ppid": 100, "cpu_percent": 15.0,
-                "memory_info": SimpleNamespace(rss=2048), "memory_percent": 2.0,
-                "status": psutil.STATUS_SLEEPING, "username": "user1",
-                "create_time": 1710590401.0, "cmdline": ["chrome", "--tabs"], "num_threads": 10
-            }),
-            MagicMock(info={
-                "pid": 103, "name": "bash", "ppid": 100, "cpu_percent": 0.0,
-                "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.5,
-                "status": psutil.STATUS_IDLE, "username": "user1",
-                "create_time": 1710590402.0, "cmdline": ["bash"], "num_threads": 1
-            }),
-        ]
+    def test_get_process_filtering_and_top(self, mock_iter, _sleep):
+        proc_python = MagicMock(info={
+            "pid": 101, "name": "python.exe", "ppid": 100,
+            "memory_info": SimpleNamespace(rss=1024), "memory_percent": 1.0,
+            "status": psutil.STATUS_RUNNING, "username": "user1",
+            "create_time": 1710590400.0, "cmdline": ["python", "app.py"], "num_threads": 2,
+        })
+        proc_python.cpu_percent.return_value = 5.0
 
-        # Test all processes, sorted by CPU
+        proc_chrome = MagicMock(info={
+            "pid": 102, "name": "chrome.exe", "ppid": 100,
+            "memory_info": SimpleNamespace(rss=2048), "memory_percent": 2.0,
+            "status": psutil.STATUS_SLEEPING, "username": "user1",
+            "create_time": 1710590401.0, "cmdline": ["chrome", "--tabs"], "num_threads": 10,
+        })
+        proc_chrome.cpu_percent.return_value = 15.0
+
+        proc_bash = MagicMock(info={
+            "pid": 103, "name": "bash", "ppid": 100,
+            "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.5,
+            "status": psutil.STATUS_IDLE, "username": "user1",
+            "create_time": 1710590402.0, "cmdline": ["bash"], "num_threads": 1,
+        })
+        proc_bash.cpu_percent.return_value = 0.0
+
+        mock_iter.return_value = [proc_python, proc_chrome, proc_bash]
+
+        # Test all processes, sorted by CPU desc
         result = process.get_process()
         self.assertEqual(len(result), 3)
         self.assertEqual(result[0]["ProcessName"], "chrome.exe")
@@ -1243,18 +1248,18 @@ class NetworkHelpersTests(unittest.TestCase):
 
 
 class ProcessEdgeCaseTests(unittest.TestCase):
+    @patch("umi_mcp.tools.process.time.sleep")
     @patch("umi_mcp.tools.process.psutil.process_iter")
-    @patch("umi_mcp.tools.process.psutil.cpu_percent")
-    def test_nameless_process_is_skipped(self, _, mock_iter):
+    def test_nameless_process_is_skipped(self, mock_iter, _sleep):
         mock_iter.return_value = [
             MagicMock(info={
-                "pid": 1, "name": None, "ppid": 0, "cpu_percent": 5.0,
+                "pid": 1, "name": None, "ppid": 0,
                 "memory_info": None, "memory_percent": None,
                 "status": psutil.STATUS_RUNNING, "username": "root",
                 "create_time": 1.0, "cmdline": [], "num_threads": 1,
             }),
             MagicMock(info={
-                "pid": 2, "name": "real_proc", "ppid": 1, "cpu_percent": 1.0,
+                "pid": 2, "name": "real_proc", "ppid": 1,
                 "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
                 "status": psutil.STATUS_RUNNING, "username": "user",
                 "create_time": 1.0, "cmdline": ["real"], "num_threads": 1,
@@ -1264,16 +1269,15 @@ class ProcessEdgeCaseTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["ProcessName"], "real_proc")
 
+    @patch("umi_mcp.tools.process.time.sleep")
     @patch("umi_mcp.tools.process.psutil.process_iter")
-    @patch("umi_mcp.tools.process.psutil.cpu_percent")
-    def test_create_time_overflow_produces_null_start_time(self, _, mock_iter):
+    def test_create_time_overflow_produces_null_start_time(self, mock_iter, _sleep):
         mock_iter.return_value = [
             MagicMock(info={
-                "pid": 1, "name": "proc", "ppid": 0, "cpu_percent": 0.0,
+                "pid": 1, "name": "proc", "ppid": 0,
                 "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
                 "status": psutil.STATUS_RUNNING, "username": "user",
-                "create_time": 1e300,
-                "cmdline": None, "num_threads": 1,
+                "create_time": 1e300, "cmdline": None, "num_threads": 1,
             }),
         ]
         result = process.get_process()
@@ -1281,33 +1285,37 @@ class ProcessEdgeCaseTests(unittest.TestCase):
         self.assertIsNone(result[0]["StartTime"])
         self.assertIsNone(result[0]["CommandLine"])
 
+    @patch("umi_mcp.tools.process.time.sleep")
     @patch("umi_mcp.tools.process.psutil.process_iter")
-    @patch("umi_mcp.tools.process.psutil.cpu_percent")
     @patch("umi_mcp.tools.process.platform.system")
-    def test_system_idle_process_skipped_only_on_windows(self, mock_system, _, mock_iter):
-        mock_iter.return_value = [
-            MagicMock(info={
-                "pid": 0, "name": "System Idle Process", "ppid": 0, "cpu_percent": 556.0,
-                "memory_info": SimpleNamespace(rss=0), "memory_percent": 0.0,
-                "status": psutil.STATUS_RUNNING, "username": "SYSTEM",
-                "create_time": 1.0, "cmdline": [], "num_threads": 4,
-            }),
-            MagicMock(info={
-                "pid": 1, "name": "real_proc", "ppid": 0, "cpu_percent": 5.0,
-                "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
-                "status": psutil.STATUS_RUNNING, "username": "user",
-                "create_time": 1.0, "cmdline": ["real"], "num_threads": 1,
-            }),
-        ]
+    def test_system_idle_process_skipped_only_on_windows(self, mock_system, mock_iter, _sleep):
+        proc_idle = MagicMock(info={
+            "pid": 0, "name": "System Idle Process", "ppid": 0,
+            "memory_info": SimpleNamespace(rss=0), "memory_percent": 0.0,
+            "status": psutil.STATUS_RUNNING, "username": "SYSTEM",
+            "create_time": 1.0, "cmdline": [], "num_threads": 4,
+        })
+        proc_idle.cpu_percent.return_value = 50.0
+
+        proc_real = MagicMock(info={
+            "pid": 1, "name": "real_proc", "ppid": 0,
+            "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
+            "status": psutil.STATUS_RUNNING, "username": "user",
+            "create_time": 1.0, "cmdline": ["real"], "num_threads": 1,
+        })
+        proc_real.cpu_percent.return_value = 5.0
+
+        mock_iter.return_value = [proc_idle, proc_real]
 
         mock_system.return_value = "Windows"
         windows_result = process.get_process()
-        self.assertEqual([entry["ProcessName"] for entry in windows_result], ["real_proc"])
+        self.assertEqual([p["ProcessName"] for p in windows_result], ["real_proc"])
 
         mock_system.return_value = "Linux"
         linux_result = process.get_process()
+        # System Idle Process has higher CPU so sorts first
         self.assertEqual(
-            [entry["ProcessName"] for entry in linux_result],
+            [p["ProcessName"] for p in linux_result],
             ["System Idle Process", "real_proc"],
         )
 

@@ -1,4 +1,5 @@
 import platform
+import time
 import psutil
 from datetime import datetime, timezone
 
@@ -15,25 +16,43 @@ STATUS_MAP = {
 }
 
 ATTRS = [
-    "pid", "name", "ppid", "cpu_percent", "memory_info",
+    "pid", "name", "ppid", "memory_info",
     "memory_percent", "status", "username", "create_time",
     "cmdline", "num_threads",
 ]
 
+CPU_SAMPLE_INTERVAL = 0.5
+
 
 def get_process(name: str = None, top: int = None) -> list[dict]:
-    results = []
+    is_windows = platform.system() == "Windows"
 
-    # Prime cpu_percent — first call always returns 0.0; second call after interval is accurate
-    psutil.cpu_percent(interval=0.5)
+    # Pass 1: collect processes and prime per-process cpu_percent baseline
+    procs = []
     for proc in psutil.process_iter(ATTRS, ad_value=None):
         info = proc.info
         if not info.get("name"):
             continue
         if name and name.lower() not in info["name"].lower():
             continue
-        if platform.system() == "Windows" and info["name"] == "System Idle Process":
+        if is_windows and info["name"] == "System Idle Process":
             continue
+        try:
+            proc.cpu_percent()  # Prime — first call always returns 0.0
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        procs.append((proc, info))
+
+    # Wait for the measurement interval
+    time.sleep(CPU_SAMPLE_INTERVAL)
+
+    # Pass 2: read accurate cpu_percent for each primed process
+    results = []
+    for proc, info in procs:
+        try:
+            cpu = proc.cpu_percent()  # Accurate delta since pass 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            cpu = 0.0
 
         mem_bytes = info["memory_info"].rss if info["memory_info"] else 0
 
@@ -53,7 +72,7 @@ def get_process(name: str = None, top: int = None) -> list[dict]:
             "ProcessName": info["name"],
             "ProcessId": info["pid"],
             "ParentProcessId": info["ppid"],
-            "CpuPercent": round(info["cpu_percent"] or 0.0, 1),
+            "CpuPercent": round(cpu, 1),
             "MemoryBytes": mem_bytes,
             "MemoryPercent": round(info["memory_percent"], 1) if info["memory_percent"] else None,
             "Status": status,
