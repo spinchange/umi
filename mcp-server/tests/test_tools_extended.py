@@ -16,6 +16,7 @@ from umi_mcp.server import (
     get_umi_uptime,
     get_umi_user,
     get_umi_service,
+    get_umi_summary,
 )
 from umi_mcp.tools import disk, uptime, network, process, service, user, events
 
@@ -411,6 +412,183 @@ class ServerToolRegistrationTests(unittest.TestCase):
         result = get_umi_service(name="ssh", status="Running")
         self.assertEqual(result, [{"ServiceName": "sshd"}])
         mock_fn.assert_called_once_with(name="ssh", status="Running")
+
+    @patch("umi_mcp.server.get_events", return_value=[])
+    @patch("umi_mcp.server.get_process", return_value=[])
+    @patch("umi_mcp.server.get_disk", return_value=[])
+    @patch("umi_mcp.server.get_uptime", return_value={"Hostname": "host1"})
+    def test_server_exposes_summary_tool(self, mock_uptime, mock_disk, mock_process, mock_events):
+        result = get_umi_summary()
+        self.assertIsInstance(result, dict)
+        mock_uptime.assert_called_once_with()
+        mock_disk.assert_called_once_with()
+        mock_process.assert_called_once_with()
+        self.assertTrue(mock_events.called)
+
+
+_UPTIME = {
+    "Hostname": "testhost", "OS": "Windows", "OSVersion": "10.0.19045",
+    "Architecture": "x64", "UptimeSeconds": 3600, "CpuCount": 8,
+    "CpuPercentOverall": 12.5, "TotalMemoryBytes": 16_000_000_000,
+    "MemoryUsedBytes": 8_000_000_000, "MemoryAvailableBytes": 8_000_000_000,
+    "LoadAverage1m": None,
+}
+_DISKS = [
+    {"TotalBytes": 500_000_000_000, "UsedBytes": 200_000_000_000, "UsedPercent": 40.0},
+    {"TotalBytes": 1_000_000_000_000, "UsedBytes": 900_000_000_000, "UsedPercent": 90.0},
+]
+_PROCESSES = [
+    {"ProcessName": "chrome",  "ProcessId": 100, "CpuPercent": 45.0, "MemoryBytes": 500_000_000},
+    {"ProcessName": "python",  "ProcessId": 200, "CpuPercent": 10.0, "MemoryBytes": 2_000_000_000},
+    {"ProcessName": "svchost", "ProcessId": 300, "CpuPercent":  2.0, "MemoryBytes": 100_000_000},
+]
+# Two events — one recent (within 24h of mock now), one old
+_NOW = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+_EVENTS = [
+    {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",   "Message": "Recent error"},
+    {"Timestamp": "2026-03-14T08:00:00+00:00", "Level": "Warning", "Message": "Old warning"},
+]
+
+
+class SummaryToolTests(unittest.TestCase):
+
+    def _call(self, uptime=None, disks=None, processes=None, events=None, **kwargs):
+        with patch("umi_mcp.server.get_uptime",  return_value=_UPTIME if uptime is None else uptime), \
+             patch("umi_mcp.server.get_disk",    return_value=_DISKS if disks is None else disks), \
+             patch("umi_mcp.server.get_process", return_value=_PROCESSES if processes is None else processes), \
+             patch("umi_mcp.server.get_events",  return_value=_EVENTS if events is None else events), \
+             patch("umi_mcp.server.datetime") as mock_dt:
+            mock_dt.now.return_value = _NOW
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.timezone = timezone
+            return get_umi_summary(**kwargs)
+
+    # --- shape ---
+
+    def test_returns_dict(self):
+        self.assertIsInstance(self._call(), dict)
+
+    def test_all_required_fields_present(self):
+        result = self._call()
+        expected = [
+            "Hostname", "OS", "OSVersion", "Architecture",
+            "UptimeSeconds", "CpuCount", "CpuUtilizationPercent",
+            "TotalMemoryBytes", "MemoryUsedBytes", "MemoryUsedPercent",
+            "LoadAverageOneMinute",
+            "TotalDiskBytes", "UsedDiskBytes", "MaxDiskUsedPercent",
+            "TopCpuProcessName", "TopCpuProcessId",
+            "TopMemoryProcessName", "TopMemoryProcessBytes",
+            "RecentErrorCount", "LastEventTimestamp", "LastEventLevel", "LastEventMessage",
+        ]
+        for field in expected:
+            self.assertIn(field, result, msg=f"Missing field: {field}")
+
+    # --- identity fields from uptime ---
+
+    def test_identity_fields_from_uptime(self):
+        result = self._call()
+        self.assertEqual(result["Hostname"],      "testhost")
+        self.assertEqual(result["OS"],            "Windows")
+        self.assertEqual(result["OSVersion"],     "10.0.19045")
+        self.assertEqual(result["Architecture"],  "x64")
+        self.assertEqual(result["UptimeSeconds"], 3600)
+        self.assertEqual(result["CpuCount"],      8)
+
+    def test_cpu_utilization_from_uptime_cpu_percent_overall(self):
+        result = self._call()
+        self.assertEqual(result["CpuUtilizationPercent"], 12.5)
+
+    def test_memory_fields_from_uptime(self):
+        result = self._call()
+        self.assertEqual(result["TotalMemoryBytes"], 16_000_000_000)
+        self.assertEqual(result["MemoryUsedBytes"],   8_000_000_000)
+
+    def test_memory_used_percent_computed(self):
+        result = self._call()
+        self.assertAlmostEqual(result["MemoryUsedPercent"], 50.0, places=1)
+
+    def test_load_average_from_uptime(self):
+        result = self._call()
+        self.assertIsNone(result["LoadAverageOneMinute"])
+
+    # --- disk aggregation ---
+
+    def test_total_disk_bytes_is_sum(self):
+        result = self._call()
+        self.assertEqual(result["TotalDiskBytes"], 1_500_000_000_000)
+
+    def test_used_disk_bytes_is_sum(self):
+        result = self._call()
+        self.assertEqual(result["UsedDiskBytes"], 1_100_000_000_000)
+
+    def test_max_disk_used_percent_is_highest_partition(self):
+        result = self._call()
+        self.assertEqual(result["MaxDiskUsedPercent"], 90.0)
+
+    def test_empty_disks_produce_zero_totals(self):
+        result = self._call(disks=[])
+        self.assertEqual(result["TotalDiskBytes"], 0)
+        self.assertEqual(result["UsedDiskBytes"],  0)
+        self.assertIsNone(result["MaxDiskUsedPercent"])
+
+    # --- process leaders ---
+
+    def test_top_cpu_process_is_first_in_sorted_list(self):
+        result = self._call()
+        # _PROCESSES already sorted by CPU desc; chrome is first
+        self.assertEqual(result["TopCpuProcessName"], "chrome")
+        self.assertEqual(result["TopCpuProcessId"],   100)
+
+    def test_top_memory_process_is_highest_memory_bytes(self):
+        result = self._call()
+        # python has the highest MemoryBytes
+        self.assertEqual(result["TopMemoryProcessName"],  "python")
+        self.assertEqual(result["TopMemoryProcessBytes"], 2_000_000_000)
+
+    def test_empty_processes_produce_null_leaders(self):
+        result = self._call(processes=[])
+        self.assertIsNone(result["TopCpuProcessName"])
+        self.assertIsNone(result["TopCpuProcessId"])
+        self.assertIsNone(result["TopMemoryProcessName"])
+        self.assertIsNone(result["TopMemoryProcessBytes"])
+
+    # --- events ---
+
+    def test_recent_error_count_filters_by_lookback_window(self):
+        # _NOW = 2026-03-16T12:00:00Z; first event is 1h old (in window),
+        # second is 52h old (outside 24h window)
+        result = self._call()
+        self.assertEqual(result["RecentErrorCount"], 1)
+
+    def test_last_event_fields_from_most_recent_event(self):
+        result = self._call()
+        self.assertEqual(result["LastEventTimestamp"], "2026-03-16T11:00:00+00:00")
+        self.assertEqual(result["LastEventLevel"],     "Error")
+        self.assertEqual(result["LastEventMessage"],   "Recent error")
+
+    def test_null_timestamp_events_excluded_from_recent_count(self):
+        events = [{"Timestamp": None, "Level": "Error", "Message": "no ts"}]
+        result = self._call(events=events)
+        self.assertEqual(result["RecentErrorCount"], 0)
+
+    def test_empty_events_produce_null_last_event_fields(self):
+        result = self._call(events=[])
+        self.assertEqual(result["RecentErrorCount"],  0)
+        self.assertIsNone(result["LastEventTimestamp"])
+        self.assertIsNone(result["LastEventLevel"])
+        self.assertIsNone(result["LastEventMessage"])
+
+    def test_custom_error_lookback_hours(self):
+        # With 72h lookback both events should be counted
+        result = self._call(error_lookback_hours=72)
+        self.assertEqual(result["RecentErrorCount"], 2)
+
+    # --- memory edge cases ---
+
+    def test_zero_total_memory_does_not_crash(self):
+        uptime = {**_UPTIME, "TotalMemoryBytes": 0, "MemoryUsedBytes": 0}
+        result = self._call(uptime=uptime)
+        self.assertIsNone(result["MemoryUsedPercent"])
 
 
 class DiskToolExtendedCoverageTests(unittest.TestCase):
