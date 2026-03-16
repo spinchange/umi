@@ -643,6 +643,14 @@ class ServiceToolExtendedCoverageTests(unittest.TestCase):
 
 
 class EventsHelperTests(unittest.TestCase):
+    def test_normalize_event_string_event_id_coerced_to_int(self):
+        # _normalize_event is defensive: if event_id arrives as a digit string
+        # (no current caller produces this, but the schema promises an int) it
+        # should be coerced so EventId is an int, not a string (line 94)
+        result = events._normalize_event(None, "Error", "src", "42", "msg")
+        self.assertEqual(result["EventId"], 42)
+        self.assertIsInstance(result["EventId"], int)
+
     def test_truncate_message_none(self):
         self.assertIsNone(events._truncate_message(None))
 
@@ -655,13 +663,17 @@ class EventsHelperTests(unittest.TestCase):
         # Numeric (int/float)
         ts = events._parse_timestamp(1710590400.0)
         self.assertEqual(ts, "2024-03-16T12:00:00+00:00")
-        
+
         # Digit string (microseconds)
         ts_str = events._parse_timestamp("1710590400000000")
         self.assertEqual(ts_str, "2024-03-16T12:00:00+00:00")
-        
-        # Overflow
+
+        # Overflow on int/float path (line 62-63)
         self.assertIsNone(events._parse_timestamp(1e30))
+
+        # Overflow on digit-string path (lines 72-73): value is all digits but
+        # int(value) / 1_000_000 still overflows datetime.fromtimestamp
+        self.assertIsNone(events._parse_timestamp("9" * 30))
 
     def test_parse_timestamp_formats(self):
         # ISO with Z
