@@ -1,184 +1,163 @@
 # UMI — Universal Machine Interface
 
-**An open schema for how AI agents query and understand machines.**
+**A Python MCP server that gives AI assistants live awareness of the machine they're running on.**
 
-UMI defines a standard set of object schemas for common system information — disk, network, processes, uptime, users — so that any tool, script, or AI agent can ask a machine about itself and get a predictable, structured answer regardless of operating system.
-
-The PowerShell module in this repo is the **reference implementation**. The schemas are the product.
+Ask your AI assistant how much disk space is left, what's using the most memory, or whether any services have crashed recently — and get a real answer, not a suggested command to run yourself.
 
 ---
 
-## The Problem
+## What it does
 
-When an AI agent needs to check disk space, it currently has to:
+UMI runs as a local [Model Context Protocol](https://modelcontextprotocol.io) server. Once installed, compatible AI clients can call its tools to query your system and reason about what they find.
 
-1. Guess the OS
-2. Pick the right command (`df -h` vs `Get-Volume` vs `diskutil`)
-3. Parse inconsistent text output
-4. Hope the column order hasn't changed between distros
+```
+You: "Is anything on this machine worth worrying about?"
 
-Every agent, in every conversation, solves this from scratch. If two agents need to hand off data to each other, they're playing telephone with unstructured text.
-
-## The Solution
-
-UMI defines **what the answer should look like** — a JSON schema for each system concept. Then it provides a PowerShell 7 module that implements those schemas cross-platform.
-
-```powershell
-# Same command. Same output shape. Any OS.
-Get-UmiDisk | Where-Object UsedPercent -gt 80
-
-# Hand it to another agent as clean JSON
-Get-UmiUptime -AsJson | clip
+AI: "C: is at 75% capacity, RAM is 87% used (866 MB free of 8 GB),
+     and the Claude Desktop service has crashed 3 times in the last
+     week according to the event log. Everything else looks normal."
 ```
 
-An agent receiving UMI output doesn't parse — it **reads**. Property names are self-documenting. Types are explicit. Enums are constrained.
+That response required no commands, no copy-pasting, and no prompting the user to open Task Manager. The AI queried the machine directly, assembled the picture, and answered in plain language.
+
+---
+
+## Tools
+
+| Tool | What it returns |
+|------|----------------|
+| `get_umi_uptime` | Hostname, OS, architecture, boot time, uptime, CPU count, RAM, **current CPU and memory utilization**, swap usage, load averages |
+| `get_umi_disk` | Mounted volumes — capacity, used/free, filesystem, **I/O counters** (reads, writes, bytes, time) |
+| `get_umi_network` | Network interfaces — IPs, MAC, speed, status, **bytes/packets sent and received**, errors, drops |
+| `get_umi_process` | Running processes sorted by CPU — filterable by name or limited to top N |
+| `get_umi_service` | System services — Windows Services, systemd units, launchd agents — with status and start type |
+| `get_umi_user` | Local user accounts — groups, admin status, home directory |
+| `get_umi_events` | Recent system log entries — Windows Event Log, journald, macOS unified log — filterable by level and source |
+
+All tools return structured JSON conforming to the [UMI schemas](./schema/). Data is cross-platform and normalized — the same property names and types regardless of OS.
+
+---
+
+## Supported clients
+
+UMI works with any MCP-compatible AI client:
+
+| Client | Notes |
+|--------|-------|
+| **Claude Desktop** | `claude_desktop_config.json` |
+| **Cursor** | MCP settings in `.cursor/mcp.json` |
+| **Windsurf** | MCP settings in config |
+| **Cline** | `cline_mcp_settings.json` |
+| **Continue** | VS Code / JetBrains extension |
+| **VS Code Copilot** | Agent Mode with MCP (GA July 2025) |
+| **Codex CLI** | `~/.codex/config.toml` |
+| **Qwen Code** | MCP settings in config |
+
+> **Note on coding assistants:** Tools like Cursor and Codex can already run shell commands directly, so UMI is less essential there. It's most useful in **chat-oriented clients** (Claude Desktop, etc.) that don't have shell access by default.
+
+---
+
+## Install
+
+Requires Python 3.10+ and pip.
+
+```bash
+pip install git+https://github.com/spinchange/umi.git#subdirectory=mcp-server
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "umi": {
+      "command": "python",
+      "args": ["-m", "umi_mcp"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. Check **Settings → Developer** to confirm UMI is listed.
+
+### Other clients
+
+The pattern is the same for all MCP clients — point the client at `python -m umi_mcp`. Check your client's MCP documentation for config file location and format.
+
+---
+
+## Platform support
+
+| OS | Status |
+|----|--------|
+| Windows 10/11 | Full support |
+| Linux (systemd) | Full support |
+| macOS 13+ | Full support |
+
+The MCP server uses [psutil](https://psutil.readthedocs.io/) for cross-platform system queries and falls back gracefully where platform-specific data isn't available (returning `null` rather than erroring).
+
+---
 
 ## Schemas
 
-The schemas live in [`/schema`](./schema/) as JSON Schema (2020-12) files:
+The JSON schemas in [`/schema`](./schema/) define the exact shape of every tool's output. They follow a few strict rules:
 
-| Schema | File | What it describes |
-|--------|------|-------------------|
-| **Disk** | `disk.schema.json` | Mounted volumes — capacity, usage, filesystem |
-| **Network** | `network.schema.json` | Network interfaces — IPs, MACs, DNS, link state |
-| **Process** | `process.schema.json` | Running processes — CPU, memory, owner, status |
-| **Uptime** | `uptime.schema.json` | System identity — hostname, OS, architecture, boot time |
-| **User** | `user.schema.json` | Local accounts — groups, admin status, home directory |
+- **PascalCase, full words** — `UsedPercent`, `MemoryBytes`, `IsAdmin`. No abbreviations.
+- **Flat objects** — one level deep. No nested structures.
+- **Constrained enums** — every enum includes `Unknown` as a fallback. Values never surprise you.
+- **Bytes as integers** — always raw bytes. The consumer decides how to display (GB, TB, etc.).
+- **ISO 8601 timestamps** — all times are machine-parseable strings with timezone.
+- **Null over absent** — optional fields always appear in output as `null`, never missing entirely.
 
-These schemas are **implementation-agnostic**. You can implement them in Python, Rust, Go, Bash — anything that outputs conforming JSON.
+These schemas are implementation-agnostic. The PowerShell module in [`/powershell`](./powershell/) is a reference implementation. Python, Go, Rust — anything that outputs conforming JSON is UMI-compatible.
 
-## PowerShell Reference Implementation
+---
 
-### Requirements
+## PowerShell reference implementation
 
-- PowerShell 7.0+ (install: https://aka.ms/powershell)
-- Works on Windows, Linux, and macOS
-
-### Install
+A PowerShell 7 module is included for Windows users who want to use UMI outside of MCP, or pipe data between scripts and agents.
 
 ```powershell
-# From the repo
-git clone https://github.com/spinchange/umi.git
-Import-Module ./umi/powershell/UMI/UMI.psd1
+Import-Module ./powershell/UMI/UMI.psd1
 
-# Verify
-Test-UmiEnvironment
-```
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `Get-UmiDisk` | Disk/volume usage |
-| `Get-UmiNetwork` | Network interfaces |
-| `Get-UmiProcess` | Running processes |
-| `Get-UmiUptime` | System identity & uptime |
-| `Get-UmiUser` | Local user accounts |
-| `Test-UmiEnvironment` | Validate your system can run UMI |
-
-### Common Parameters
-
-Every `Get-Umi*` command supports:
-
-- **`-AsJson`** — Output as a JSON string instead of PowerShell objects. Ideal for piping to files, APIs, or other agents.
-
-### Examples
-
-```powershell
-# Am I running low on disk space?
-Get-UmiDisk | Where-Object UsedPercent -gt 90
-
-# What's eating my CPU?
+Get-UmiDisk | Where-Object UsedPercent -gt 80
 Get-UmiProcess -Top 5
-
-# Quick system fingerprint for an agent
 Get-UmiUptime -AsJson
-
-# All admin users on this machine
-Get-UmiUser | Where-Object IsAdmin -eq $true
-
-# Which network interface has an IP?
-Get-UmiNetwork | Where-Object IPv4Address -ne $null
 ```
 
-### Testing
-
 ```powershell
-# Requires Pester 5+
-Install-Module Pester -Force -SkipPublisherCheck
+# Run tests (requires Pester 5+)
 Invoke-Pester ./powershell/Tests/UMI.Tests.ps1
 ```
 
-## For Agent / LLM Developers
+---
 
-UMI is designed to be consumed by AI agents. Key design decisions:
+## Tests
 
-- **Flat objects** — no deep nesting. Every property is one level deep.
-- **Self-documenting names** — `UsedPercent`, `MemoryBytes`, `IsAdmin`. No abbreviations, no codes.
-- **Constrained enums** — `Status` is always one of `Running|Sleeping|Stopped|Zombie|Idle|Unknown`. Never a surprise value.
-- **Bytes as integers** — always raw bytes. The agent decides how to display (GB, GiB, TB). No pre-formatted strings in data fields.
-- **ISO 8601 timestamps** — all times are machine-parseable strings.
-- **Null over absent** — optional properties return `null`, never missing keys. Agents don't need try/catch for missing fields.
-
-### Example: Agent-to-Agent Handoff
-
-```
-Agent 1 runs: Get-UmiProcess -Top 5 -AsJson
-Agent 1 passes JSON to Agent 2
-Agent 2 parses with zero ambiguity — property names and types are guaranteed
-Agent 2 acts on the data (alert, remediate, report)
+```bash
+python -m unittest discover -s mcp-server/tests -v
 ```
 
-No regex. No "which column was CPU again?" No "does this distro put PID first or second?"
-
-## Implementing the Schema in Other Languages
-
-The schemas in `/schema` are standard JSON Schema. To create a conforming implementation:
-
-1. Read the `.schema.json` for the object type you're implementing
-2. Query the OS using whatever native method your language supports
-3. Output a JSON object matching the schema — same property names, same types, same enum values
-
-A Python implementation might look like:
-
-```python
-import psutil, json
-
-def get_umi_disk():
-    disks = []
-    for part in psutil.disk_partitions():
-        usage = psutil.disk_usage(part.mountpoint)
-        disks.append({
-            "DeviceName": part.device,
-            "MountPoint": part.mountpoint,
-            "FileSystem": part.fstype.upper(),
-            "TotalBytes": usage.total,
-            "UsedBytes": usage.used,
-            "FreeBytes": usage.free,
-            "UsedPercent": round(usage.percent, 1),
-            "IsRemovable": False,
-            "Label": None
-        })
-    return json.dumps(disks, indent=2)
-```
-
-If the output conforms to the schema, it's UMI-compatible. The language doesn't matter.
+---
 
 ## Contributing
 
-This project is in early development. The most valuable contributions right now:
+The most useful contributions right now:
 
-1. **Schema feedback** — Are the property names obvious? Are we missing critical fields?
-2. **Edge case reports** — "Get-UmiDisk doesn't handle ZFS on FreeBSD" — great, file an issue.
-3. **Alternative implementations** — Python, Rust, Go implementations of the schemas.
-4. **Agent integration stories** — How are you using UMI with your AI tooling?
+- **New platforms or edge cases** — ZFS, NixOS, unusual hardware, BSD variants
+- **Schema feedback** — missing fields, naming that isn't obvious, type mismatches
+- **Alternative implementations** — Go, Rust, or Bash modules conforming to the schemas
+- **Client compatibility reports** — does it work with a client not listed above?
+
+File an issue or open a PR.
+
+---
 
 ## License
 
 MIT
-
-## Links
-
-- Schema spec: [`/schema`](./schema/)
-- PowerShell module: [`/powershell`](./powershell/)
-- Project site: [spinchange.github.io/umi](https://spinchange.github.io/umi)
