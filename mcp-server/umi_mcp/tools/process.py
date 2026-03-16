@@ -23,6 +23,8 @@ ATTRS = [
 def get_process(name: str = None, top: int = None) -> list[dict]:
     results = []
 
+    # Prime cpu_percent — first call always returns 0.0; second call after interval is accurate
+    psutil.cpu_percent(interval=0.5)
     for proc in psutil.process_iter(ATTRS, ad_value=None):
         info = proc.info
         if not info.get("name"):
