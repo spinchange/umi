@@ -953,6 +953,25 @@ class EventsToolExtendedTests(unittest.TestCase):
 
     @patch("umi_mcp.tools.events.subprocess.run")
     @patch("umi_mcp.tools.events.platform.system", return_value="Windows")
+    def test_info_alias_passes_level_4_to_windows(self, _sys, mock_run):
+        # "Info" must normalize to "Information" (level 4), not fall back to Error (level 2)
+        mock_run.return_value = SimpleNamespace(returncode=1, stdout="")
+        events.get_events(level="Info")
+        cmd = mock_run.call_args[0][0]
+        ps_cmd = " ".join(cmd)
+        self.assertIn("Level=4", ps_cmd)
+        self.assertNotIn("Level=2", ps_cmd)
+
+    @patch("umi_mcp.tools.events.subprocess.run")
+    @patch("umi_mcp.tools.events.platform.system", return_value="Linux")
+    def test_info_alias_passes_info_priority_to_linux(self, _sys, mock_run):
+        mock_run.return_value = SimpleNamespace(returncode=1, stdout="")
+        events.get_events(level="Info")
+        cmd = mock_run.call_args[0][0]
+        self.assertIn("info", cmd)
+
+    @patch("umi_mcp.tools.events.subprocess.run")
+    @patch("umi_mcp.tools.events.platform.system", return_value="Windows")
     def test_get_events_windows_edge_cases(self, _sys, mock_run):
         # OSError
         mock_run.side_effect = OSError("Access denied")

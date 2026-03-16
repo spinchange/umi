@@ -10,6 +10,10 @@ _MS_DATE_RE = re.compile(r"^/Date\((\d+)(?:[+-]\d{4})?\)/$")
 
 MAX_MESSAGE_LENGTH = 500
 COMMAND_TIMEOUT_SECONDS = 30
+
+# Normalize user-facing aliases to canonical internal names before platform dispatch
+_LEVEL_ALIASES = {"Info": "Information"}
+
 WINDOWS_LEVEL_MAP = {
     "Critical": 1,
     "Error": 2,
@@ -114,6 +118,7 @@ def _normalize_event(timestamp, level, source, event_id, message) -> dict:
 
 
 def get_events(level: str = "Error", source: str = None, last_n: int = 20) -> list[dict]:
+    level = _LEVEL_ALIASES.get(level, level)
     requested = max(int(last_n or 20), 1)
     os_name = platform.system()
 
