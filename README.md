@@ -62,8 +62,45 @@ UMI works with any MCP-compatible AI client:
 Requires Python 3.10+ and pip.
 
 ```bash
-pip install git+https://github.com/spinchange/umi.git#subdirectory=mcp-server
+pip install umi-mcp
 ```
+
+### Auto-installers
+
+UMI includes installers that will:
+
+- ensure `umi-mcp` is installed for your active Python
+- detect supported AI clients already present on the machine
+- merge the `umi` MCP entry into each client config without overwriting other settings
+- skip clients that already have a `umi` entry
+
+Run the installer for your platform:
+
+```powershell
+./install/Install-UMI.ps1
+```
+
+```bash
+./install/install-umi.sh
+```
+
+The installer checks these client config locations and creates the config file when the client directory exists but the file does not:
+
+| Client | Config path |
+|--------|-------------|
+| Claude Desktop (Windows) | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Claude Desktop (macOS) | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Claude Desktop (Linux) | `~/.config/Claude/claude_desktop_config.json` |
+| Codex CLI | `~/.codex/config.toml` |
+| Cursor | `~/.cursor/mcp.json` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Cline | `~/.vscode/globalStorage/saoudrizwan.claude-dev/cline_mcp_settings.json` |
+
+Restart any configured clients after the installer finishes.
+
+### Manual configuration
+
+If you prefer to configure a client yourself, add the UMI MCP entry below.
 
 ### Claude Desktop
 
