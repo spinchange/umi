@@ -255,15 +255,17 @@ class ServiceToolTests(unittest.TestCase):
 
 
 class UserToolTests(unittest.TestCase):
-    @patch.dict("umi_mcp.tools.user.os.environ", {"USERNAME": "testuser", "USERSID": "S-1-5-21-123"})
     @patch("umi_mcp.tools.user.platform.system", return_value="Windows")
     def test_get_user_windows(self, _sys):
-        with patch("ctypes.windll.shell32.IsUserAnAdmin", return_value=1, create=True):
-            result = user.get_user()
-            self.assertEqual(len(result), 1)
-            self.assertEqual(result[0]["Username"], "testuser")
-            self.assertEqual(result[0]["UserId"], "S-1-5-21-123")
-            self.assertTrue(result[0]["IsAdmin"])
+        mock_ctypes = MagicMock()
+        mock_ctypes.windll.shell32.IsUserAnAdmin.return_value = 1
+        with patch.dict(sys.modules, {"ctypes": mock_ctypes}):
+            with patch.dict("umi_mcp.tools.user.os.environ", {"USERNAME": "testuser", "USERSID": "S-1-5-21-123"}):
+                result = user.get_user()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["Username"], "testuser")
+        self.assertEqual(result[0]["UserId"], "S-1-5-21-123")
+        self.assertTrue(result[0]["IsAdmin"])
 
     @patch("umi_mcp.tools.user.platform.system", return_value="Linux")
     def test_get_user_unix(self, _sys):
