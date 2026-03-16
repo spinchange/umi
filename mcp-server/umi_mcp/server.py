@@ -79,6 +79,7 @@ def get_umi_events(level: str = "Error", source: str = None, last_n: int = 20) -
     Returns recent system events/log entries normalized across Windows Event Log,
     Linux journald, and macOS unified logging. Filter by severity level, optional
     source substring, and limit the number of returned entries with last_n.
+    Valid level values: Info, Warning, Error, Critical (default: Error).
     Message is truncated to 500 characters.
     """
     return get_events(level=level, source=source, last_n=last_n)
