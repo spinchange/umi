@@ -5,9 +5,18 @@ import psutil
 import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from contextlib import ExitStack
 from unittest.mock import patch, MagicMock
 
-from umi_mcp.tools import uptime, network, process, service, user
+from umi_mcp.server import (
+    get_umi_disk,
+    get_umi_network,
+    get_umi_process,
+    get_umi_uptime,
+    get_umi_user,
+    get_umi_service,
+)
+from umi_mcp.tools import disk, uptime, network, process, service, user
 
 
 class UptimeToolTests(unittest.TestCase):
@@ -289,6 +298,348 @@ class UserToolTests(unittest.TestCase):
                 result_current = user.get_user(current_only=True)
                 self.assertEqual(len(result_current), 1)
                 self.assertEqual(result_current[0]["Username"], "user1")
+
+
+class UptimeLinuxToolTests(unittest.TestCase):
+    def _base_patches(self):
+        """Return a list of common patches shared by both Linux uptime tests."""
+        return [
+            patch("umi_mcp.tools.uptime.platform.system", return_value="Linux"),
+            patch("umi_mcp.tools.uptime.platform.machine", return_value="x86_64"),
+            patch("umi_mcp.tools.uptime.socket.gethostname", return_value="linux-host"),
+            patch("umi_mcp.tools.uptime.psutil.boot_time", return_value=1710590400.0),
+            patch("umi_mcp.tools.uptime.psutil.cpu_count", return_value=4),
+            patch("umi_mcp.tools.uptime.psutil.cpu_percent", return_value=5.0),
+            patch("umi_mcp.tools.uptime.psutil.getloadavg", return_value=(0.5, 0.4, 0.3)),
+            patch(
+                "umi_mcp.tools.uptime.psutil.virtual_memory",
+                return_value=SimpleNamespace(total=8000, used=4000, available=4000),
+            ),
+            patch(
+                "umi_mcp.tools.uptime.psutil.swap_memory",
+                return_value=SimpleNamespace(total=2000, used=500),
+            ),
+            patch(
+                "umi_mcp.tools.uptime.datetime",
+                **{
+                    "now.return_value": datetime(2024, 3, 16, 13, 0, 0, tzinfo=timezone.utc),
+                    "fromtimestamp.return_value": datetime(2024, 3, 16, 12, 0, 0, tzinfo=timezone.utc),
+                },
+            ),
+        ]
+
+    def test_uptime_linux_with_distro(self):
+        mock_distro = MagicMock()
+        mock_distro.name.return_value = "Ubuntu"
+        mock_distro.version.return_value = "22.04"
+
+        patches = self._base_patches()
+        with patch.dict(sys.modules, {"distro": mock_distro}):
+            with ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                result = uptime.get_uptime()
+
+        self.assertEqual(result["OS"], "Linux")
+        self.assertEqual(result["OSVersion"], "Ubuntu 22.04")
+        self.assertEqual(result["Hostname"], "linux-host")
+        self.assertEqual(result["LoadAverage1m"], 0.5)
+
+    def test_uptime_linux_distro_import_error_falls_back_to_platform_release(self):
+        patches = self._base_patches()
+        patches.append(
+            patch("umi_mcp.tools.uptime.platform.release", return_value="5.15.0-generic")
+        )
+
+        with patch.dict(sys.modules, {"distro": None}):
+            with ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                result = uptime.get_uptime()
+
+        self.assertEqual(result["OS"], "Linux")
+        self.assertEqual(result["OSVersion"], "5.15.0-generic")
+
+
+class ServerToolRegistrationTests(unittest.TestCase):
+    @patch("umi_mcp.server.get_disk", return_value=[{"MountPoint": "/"}])
+    def test_server_exposes_disk_tool(self, mock_fn):
+        result = get_umi_disk()
+        self.assertEqual(result, [{"MountPoint": "/"}])
+        mock_fn.assert_called_once_with()
+
+    @patch("umi_mcp.server.get_network", return_value=[{"InterfaceName": "eth0"}])
+    def test_server_exposes_network_tool(self, mock_fn):
+        result = get_umi_network(include_down=True)
+        self.assertEqual(result, [{"InterfaceName": "eth0"}])
+        mock_fn.assert_called_once_with(include_down=True)
+
+    @patch("umi_mcp.server.get_process", return_value=[{"ProcessName": "python"}])
+    def test_server_exposes_process_tool(self, mock_fn):
+        result = get_umi_process(name="python", top=5)
+        self.assertEqual(result, [{"ProcessName": "python"}])
+        mock_fn.assert_called_once_with(name="python", top=5)
+
+    @patch("umi_mcp.server.get_uptime", return_value={"Hostname": "host1"})
+    def test_server_exposes_uptime_tool(self, mock_fn):
+        result = get_umi_uptime()
+        self.assertEqual(result, {"Hostname": "host1"})
+        mock_fn.assert_called_once_with()
+
+    @patch("umi_mcp.server.get_user", return_value=[{"Username": "alice"}])
+    def test_server_exposes_user_tool(self, mock_fn):
+        result = get_umi_user(current_only=True)
+        self.assertEqual(result, [{"Username": "alice"}])
+        mock_fn.assert_called_once_with(current_only=True)
+
+    @patch("umi_mcp.server.get_service", return_value=[{"ServiceName": "sshd"}])
+    def test_server_exposes_service_tool(self, mock_fn):
+        result = get_umi_service(name="ssh", status="Running")
+        self.assertEqual(result, [{"ServiceName": "sshd"}])
+        mock_fn.assert_called_once_with(name="ssh", status="Running")
+
+
+class DiskToolExtendedCoverageTests(unittest.TestCase):
+    @patch("umi_mcp.tools.disk.psutil.disk_io_counters")
+    @patch("umi_mcp.tools.disk.psutil.disk_usage")
+    @patch("umi_mcp.tools.disk.psutil.disk_partitions")
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
+    def test_get_disk_linux_filters_pseudo_filesystems(
+        self,
+        _mock_system,
+        mock_partitions,
+        mock_usage,
+        mock_io_counters,
+    ):
+        mock_partitions.return_value = [
+            SimpleNamespace(device="tmpfs", mountpoint="/run", fstype="tmpfs"),
+            SimpleNamespace(device="devtmpfs", mountpoint="/dev", fstype="devtmpfs"),
+            SimpleNamespace(device="/dev/loop0", mountpoint="/snap/core", fstype="squashfs"),
+            SimpleNamespace(device="/dev/sda1", mountpoint="/", fstype="ext4"),
+            SimpleNamespace(device="/dev/sdb1", mountpoint="/data", fstype="xfs"),
+        ]
+        mock_usage.side_effect = [
+            SimpleNamespace(total=1000, used=250, free=750),
+            SimpleNamespace(total=2000, used=1000, free=1000),
+        ]
+        mock_io_counters.return_value = {
+            "sda": SimpleNamespace(
+                read_count=1,
+                write_count=2,
+                read_bytes=3,
+                write_bytes=4,
+                read_time=5,
+                write_time=6,
+            ),
+            "sdb": SimpleNamespace(
+                read_count=7,
+                write_count=8,
+                read_bytes=9,
+                write_bytes=10,
+                read_time=11,
+                write_time=12,
+            ),
+        }
+
+        result = disk.get_disk()
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual([entry["MountPoint"] for entry in result], ["/", "/data"])
+        self.assertEqual(result[0]["FileSystem"], "EXT4")
+        self.assertEqual(result[1]["FileSystem"], "XFS")
+        self.assertEqual(result[0]["ReadBytes"], 3)
+        self.assertEqual(result[1]["WriteBytes"], 10)
+
+    @patch("umi_mcp.tools.disk.psutil.disk_io_counters")
+    @patch("umi_mcp.tools.disk.psutil.disk_usage")
+    @patch("umi_mcp.tools.disk.psutil.disk_partitions")
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Darwin")
+    def test_get_disk_macos_filters_pseudo_filesystems(
+        self,
+        _mock_system,
+        mock_partitions,
+        mock_usage,
+        mock_io_counters,
+    ):
+        mock_partitions.return_value = [
+            SimpleNamespace(device="map auto_home", mountpoint="/System/Volumes/Data/home", fstype="autofs"),
+            SimpleNamespace(device="/dev/disk3s1", mountpoint="/", fstype="apfs"),
+            SimpleNamespace(device="/dev/disk4s2", mountpoint="/Volumes/External", fstype="hfs"),
+        ]
+        mock_usage.side_effect = [
+            SimpleNamespace(total=5000, used=2000, free=3000),
+            SimpleNamespace(total=4000, used=1000, free=3000),
+        ]
+        mock_io_counters.return_value = {
+            "disk3": SimpleNamespace(
+                read_count=10,
+                write_count=20,
+                read_bytes=30,
+                write_bytes=40,
+                read_time=50,
+                write_time=60,
+            ),
+            "disk4": SimpleNamespace(
+                read_count=11,
+                write_count=21,
+                read_bytes=31,
+                write_bytes=41,
+                read_time=51,
+                write_time=61,
+            ),
+        }
+
+        result = disk.get_disk()
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual([entry["MountPoint"] for entry in result], ["/", "/Volumes/External"])
+        self.assertEqual(result[0]["FileSystem"], "APFS")
+        self.assertEqual(result[1]["FileSystem"], "HFS")
+        self.assertEqual(result[0]["ReadTimeMs"], 50)
+        self.assertEqual(result[1]["WriteTimeMs"], 61)
+
+    @patch("umi_mcp.tools.disk.psutil.disk_io_counters", return_value={})
+    @patch("umi_mcp.tools.disk.psutil.disk_usage")
+    @patch("umi_mcp.tools.disk.psutil.disk_partitions")
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
+    def test_get_disk_skips_permission_error_partition_only(
+        self,
+        _mock_system,
+        mock_partitions,
+        mock_usage,
+        _mock_io_counters,
+    ):
+        mock_partitions.return_value = [
+            SimpleNamespace(device="/dev/sda1", mountpoint="/", fstype="ext4"),
+            SimpleNamespace(device="/dev/sdb1", mountpoint="/restricted", fstype="ext4"),
+            SimpleNamespace(device="/dev/sdc1", mountpoint="/data", fstype="ext4"),
+        ]
+
+        def usage_for_mount(mountpoint):
+            if mountpoint == "/restricted":
+                raise PermissionError("denied")
+            if mountpoint == "/":
+                return SimpleNamespace(total=1000, used=100, free=900)
+            return SimpleNamespace(total=2000, used=500, free=1500)
+
+        mock_usage.side_effect = usage_for_mount
+
+        result = disk.get_disk()
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual([entry["MountPoint"] for entry in result], ["/", "/data"])
+
+    @patch("umi_mcp.tools.disk.psutil.disk_io_counters")
+    @patch("umi_mcp.tools.disk.psutil.disk_usage")
+    @patch("umi_mcp.tools.disk.psutil.disk_partitions")
+    @patch("umi_mcp.tools.disk.platform.system", return_value="Linux")
+    def test_get_disk_io_none_keeps_null_keys(
+        self,
+        _mock_system,
+        mock_partitions,
+        mock_usage,
+        mock_io_counters,
+    ):
+        mock_partitions.return_value = [
+            SimpleNamespace(device="/dev/sda1", mountpoint="/", fstype="ext4")
+        ]
+        mock_usage.return_value = SimpleNamespace(total=1000, used=500, free=500)
+        mock_io_counters.return_value = {"sda": None}
+
+        result = disk.get_disk()
+
+        self.assertEqual(len(result), 1)
+        for field in (
+            "ReadCount",
+            "WriteCount",
+            "ReadBytes",
+            "WriteBytes",
+            "ReadTimeMs",
+            "WriteTimeMs",
+        ):
+            self.assertIn(field, result[0])
+            self.assertIsNone(result[0][field])
+
+
+class ServiceToolExtendedCoverageTests(unittest.TestCase):
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Windows")
+    def test_get_service_windows_returns_empty_on_nonzero_exit(self, _sys, mock_run):
+        mock_run.return_value = SimpleNamespace(returncode=1, stdout="")
+
+        result = service.get_service()
+
+        self.assertEqual(result, [])
+
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Windows")
+    def test_get_service_windows_filters_by_status(self, _sys, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {"Name": "SvcRunning", "State": "Running", "StartMode": "Auto"},
+                    {"Name": "SvcStopped", "State": "Stopped", "StartMode": "Manual"},
+                ]
+            ),
+        )
+
+        result = service.get_service(status="Running")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ServiceName"], "SvcRunning")
+        self.assertEqual(result[0]["Status"], "Running")
+        self.assertIn("DisplayName", result[0])
+        self.assertIsNone(result[0]["DisplayName"])
+
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Linux")
+    def test_get_service_linux_returns_empty_on_subprocess_failure(self, _sys, mock_run):
+        mock_run.side_effect = OSError("systemctl unavailable")
+
+        result = service.get_service()
+
+        self.assertEqual(result, [])
+
+    @patch("umi_mcp.tools.service.subprocess.run")
+    @patch("umi_mcp.tools.service.platform.system", return_value="Darwin")
+    def test_get_service_macos_filters_by_status(self, _sys, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="pid\tstatus\tlabel\n123\t0\tcom.apple.running\n-\t0\tcom.apple.stopped",
+        )
+
+        running = service.get_service(status="Running")
+        stopped = service.get_service(status="Stopped")
+
+        self.assertEqual(running, [
+            {
+                "ServiceName": "com.apple.running",
+                "DisplayName": "com.apple.running",
+                "Description": None,
+                "Status": "Running",
+                "StartType": "Unknown",
+                "User": None,
+                "ProcessId": 123,
+                "BinaryPath": None,
+                "UptimeSeconds": None,
+                "ExitCode": None,
+            }
+        ])
+        self.assertEqual(stopped, [
+            {
+                "ServiceName": "com.apple.stopped",
+                "DisplayName": "com.apple.stopped",
+                "Description": None,
+                "Status": "Stopped",
+                "StartType": "Unknown",
+                "User": None,
+                "ProcessId": None,
+                "BinaryPath": None,
+                "UptimeSeconds": None,
+                "ExitCode": None,
+            }
+        ])
 
 
 if __name__ == "__main__":
