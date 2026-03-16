@@ -1,6 +1,11 @@
 # UMI — Universal Machine Interface
 
 [![Tests](https://github.com/spinchange/umi/actions/workflows/test.yml/badge.svg)](https://github.com/spinchange/umi/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/spinchange/umi/graph/badge.svg)](https://codecov.io/gh/spinchange/umi)
+[![License](https://img.shields.io/github/license/spinchange/umi)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://pypi.org/project/umi-mcp/)
+[![Platform](https://img.shields.io/badge/platform-windows%20|%20linux%20|%20macos-lightgrey)]()
+[![MCP](https://img.shields.io/badge/MCP-compatible-purple)](https://modelcontextprotocol.io)
 
 **A Python MCP server that gives AI assistants live awareness of the machine they're running on.**
 
