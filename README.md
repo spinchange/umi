@@ -1,5 +1,7 @@
 # UMI — Universal Machine Interface
 
+[![Tests](https://github.com/spinchange/umi/actions/workflows/test.yml/badge.svg)](https://github.com/spinchange/umi/actions/workflows/test.yml)
+
 **A Python MCP server that gives AI assistants live awareness of the machine they're running on.**
 
 Ask your AI assistant how much disk space is left, what's using the most memory, or whether any services have crashed recently — and get a real answer, not a suggested command to run yourself.
@@ -177,8 +179,11 @@ Invoke-Pester ./powershell/Tests/UMI.Tests.ps1
 ## Tests
 
 ```bash
-python -m unittest discover -s mcp-server/tests -v
+pip install pytest pytest-cov
+pytest mcp-server/tests/ --cov=umi_mcp --cov-report=term-missing
 ```
+
+76 tests covering all 7 tools across Windows, Linux, and macOS paths — including subprocess failure modes, null-field handling, platform branching, and entry point wiring. 100% statement coverage.
 
 ---
 
