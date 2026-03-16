@@ -1,6 +1,7 @@
 from mcp.server.fastmcp import FastMCP
 
 from .tools.disk import get_disk
+from .tools.events import get_events
 from .tools.network import get_network
 from .tools.process import get_process
 from .tools.uptime import get_uptime
@@ -70,3 +71,14 @@ def get_umi_service(name: str = None, status: str = None) -> list[dict]:
     (Running, Stopped, Degraded, Starting, Stopping, Paused).
     """
     return get_service(name=name, status=status)
+
+
+@mcp.tool()
+def get_umi_events(level: str = "Error", source: str = None, last_n: int = 20) -> list[dict]:
+    """
+    Returns recent system events/log entries normalized across Windows Event Log,
+    Linux journald, and macOS unified logging. Filter by severity level, optional
+    source substring, and limit the number of returned entries with last_n.
+    Message is truncated to 500 characters.
+    """
+    return get_events(level=level, source=source, last_n=last_n)

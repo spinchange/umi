@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://universalmachine.dev/schema/events/v1",
+  "title": "UMI Event Object",
+  "description": "Universal Machine Interface schema for system and application event logs.",
+  "type": "object",
+  "required": ["Timestamp", "Source", "Level", "EventId", "Message"],
+  "properties": {
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when the event occurred."
+    },
+    "Source": {
+      "type": "string",
+      "description": "The application or component that logged the event.",
+      "examples": ["Microsoft-Windows-Security-Auditing", "systemd", "kernel"]
+    },
+    "Level": {
+      "type": "string",
+      "enum": ["Critical", "Error", "Warning", "Information", "Verbose", "Unknown"],
+      "description": "Normalized severity level."
+    },
+    "EventId": {
+      "type": "integer",
+      "description": "Numeric identifier for the specific event type."
+    },
+    "Message": {
+      "type": "string",
+      "description": "The human-readable description of the event."
+    },
+    "LogName": {
+      "type": ["string", "null"],
+      "description": "The name of the log the event belongs to.",
+      "examples": ["System", "Application", "Security"]
+    },
+    "User": {
+      "type": ["string", "null"],
+      "description": "The username associated with the event, if applicable."
+    },
+    "MachineName": {
+      "type": ["string", "null"],
+      "description": "The name of the computer where the event occurred."
+    },
+    "ProcessId": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "The PID of the process that generated the event."
+    },
+    "ThreadId": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "The ID of the thread that generated the event."
+    }
+  },
+  "additionalProperties": false
+}

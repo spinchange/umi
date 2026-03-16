@@ -23,6 +23,8 @@ BeforeAll {
         $source = $source.Replace('$IsMacOS', '$__umiIsMacOS')
         $source = $source.Replace('2>/dev/null', '')
         $source = $source.Replace('& ps ', '& __umi_ps ')
+        $source = $source.Replace('& id ', '& __umi_id ')
+        $source = $source.Replace('& last ', '& __umi_last ')
         $platformSetup = switch ($Platform) {
             'Windows' { '$__umiIsWindows = $true; $__umiIsLinux = $false; $__umiIsMacOS = $false' }
             'Linux'   { '$__umiIsWindows = $false; $__umiIsLinux = $true; $__umiIsMacOS = $false' }
@@ -316,13 +318,12 @@ function Get-Content {
     if ($Path -eq '/etc/passwd') { return 'alice:x:1000:1000:Alice Example:/home/alice:/bin/bash' }
     Microsoft.PowerShell.Management\Get-Content @PSBoundParameters
 }
-function id {
-    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+function __umi_id {
+    $Args = $args
     if ($Args[0] -eq '-u') { return '1000' }
     if ($Args[0] -eq '-Gn') { return 'sudo users' }
 }
-function last {
-    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+function __umi_last {
     'alice pts/0 10.0.0.5 Mon Mar 15 08:30 - 09:30 (01:00)'
 }
 '@
@@ -339,13 +340,12 @@ function Get-Content {
     if ($Path -eq '/etc/passwd') { return 'alice:x:501:20:Alice Example:/Users/alice:/bin/zsh' }
     Microsoft.PowerShell.Management\Get-Content @PSBoundParameters
 }
-function id {
-    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+function __umi_id {
+    $Args = $args
     if ($Args[0] -eq '-u') { return '501' }
     if ($Args[0] -eq '-Gn') { return 'staff admin' }
 }
-function last {
-    param([Parameter(ValueFromRemainingArguments = $true)] [object[]]$Args)
+function __umi_last {
     'alice console Mon Mar 15 08:30   still logged in'
 }
 '@

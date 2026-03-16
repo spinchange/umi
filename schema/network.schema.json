@@ -54,6 +54,46 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "List of configured DNS server addresses."
+    },
+    "BytesSent": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total bytes transmitted on this interface since boot."
+    },
+    "BytesReceived": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total bytes received on this interface since boot."
+    },
+    "PacketsSent": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total packets transmitted on this interface since boot."
+    },
+    "PacketsReceived": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total packets received on this interface since boot."
+    },
+    "ErrorsIn": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total receive errors on this interface."
+    },
+    "ErrorsOut": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total transmit errors on this interface."
+    },
+    "DropsIn": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total received packets dropped."
+    },
+    "DropsOut": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total transmitted packets dropped."
     }
   },
   "additionalProperties": false

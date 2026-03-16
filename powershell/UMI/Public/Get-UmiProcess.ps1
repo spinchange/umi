@@ -119,11 +119,11 @@ function Get-UmiProcess {
                 $memBytes = if ($totalMem -and $memPct -gt 0) {
                     [long]($totalMem * $memPct / 100)
                 } else { [long]0 }
-                $pid = [int]$parts[0]
+                $processId = [int]$parts[0]
                 $threadCount = $null
 
                 if ($IsLinux) {
-                    $procStatus = Get-Content "/proc/$pid/status" -ErrorAction SilentlyContinue
+                    $procStatus = Get-Content "/proc/$processId/status" -ErrorAction SilentlyContinue
                     foreach ($statusLine in $procStatus) {
                         if ($statusLine -match '^Threads:\s+(\d+)') {
                             $threadCount = [int]$Matches[1]
@@ -135,7 +135,7 @@ function Get-UmiProcess {
                 $results += [PSCustomObject]@{
                     PSTypeName      = 'UMI.Process'
                     ProcessName     = $parts[6] -replace '.*/(.+)$', '$1'  # strip path
-                    ProcessId       = $pid
+                    ProcessId       = $processId
                     ParentProcessId = [int]$parts[1]
                     CpuPercent      = $cpuPct
                     MemoryBytes     = $memBytes

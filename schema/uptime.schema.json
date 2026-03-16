@@ -55,6 +55,47 @@
       "type": ["string", "null"],
       "description": "PowerShell version if running inside PS, null otherwise.",
       "examples": ["7.4.1"]
+    },
+    "CpuPercentOverall": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Aggregate CPU usage across all cores as a percentage."
+    },
+    "MemoryUsedBytes": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total RAM currently in use in bytes."
+    },
+    "MemoryAvailableBytes": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total RAM available for allocation in bytes."
+    },
+    "SwapTotalBytes": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total virtual memory / swap space in bytes."
+    },
+    "SwapUsedBytes": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total virtual memory / swap space currently in use in bytes."
+    },
+    "LoadAverage1m": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "System load average over the last 1 minute. Null on Windows if not implemented."
+    },
+    "LoadAverage5m": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "System load average over the last 5 minutes. Null on Windows if not implemented."
+    },
+    "LoadAverage15m": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "System load average over the last 15 minutes. Null on Windows if not implemented."
     }
   },
   "additionalProperties": false

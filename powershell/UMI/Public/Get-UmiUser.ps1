@@ -95,7 +95,7 @@ function Get-UmiUser {
 
                 $dateMatch = [regex]::Match(
                     $lastLine,
-                    '(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}(?::\d{2})?(?:\s+\d{4})?'
+                    '(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}(?::\d{2})?(?:\s+\d{4})?'
                 )
                 if (-not $dateMatch.Success) {
                     return $null
@@ -105,18 +105,18 @@ function Get-UmiUser {
                 $hasYear = $dateText -match '\s\d{4}$'
                 $formats = if ($hasYear) {
                     @(
-                        'ddd MMM d HH:mm:ss yyyy',
-                        'ddd MMM dd HH:mm:ss yyyy',
-                        'ddd MMM d HH:mm yyyy',
-                        'ddd MMM dd HH:mm yyyy'
+                        'MMM d HH:mm:ss yyyy',
+                        'MMM dd HH:mm:ss yyyy',
+                        'MMM d HH:mm yyyy',
+                        'MMM dd HH:mm yyyy'
                     )
                 }
                 else {
                     @(
-                        'ddd MMM d HH:mm:ss',
-                        'ddd MMM dd HH:mm:ss',
-                        'ddd MMM d HH:mm',
-                        'ddd MMM dd HH:mm'
+                        'MMM d HH:mm:ss',
+                        'MMM dd HH:mm:ss',
+                        'MMM d HH:mm',
+                        'MMM dd HH:mm'
                     )
                 }
 

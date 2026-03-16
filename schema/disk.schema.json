@@ -49,6 +49,26 @@
     "Label": {
       "type": ["string", "null"],
       "description": "Volume label if one exists, null otherwise."
+    },
+    "ReadBytes": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total bytes read from the disk since boot."
+    },
+    "WriteBytes": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total bytes written to the disk since boot."
+    },
+    "ReadCount": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total number of read operations since boot."
+    },
+    "WriteCount": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total number of write operations since boot."
     }
   },
   "additionalProperties": false
