@@ -17,6 +17,8 @@ from umi_mcp.server import (
     get_umi_user,
     get_umi_service,
     get_umi_summary,
+    get_umi_event_summary,
+    get_umi_recent_changes,
 )
 from umi_mcp.tools import disk, uptime, network, process, service, user, events
 
@@ -382,40 +384,53 @@ class UptimeLinuxToolTests(unittest.TestCase):
 
 
 class ServerToolRegistrationTests(unittest.TestCase):
+    def _assert_envelope(self, result):
+        """Assert that result is a properly-shaped UMI response envelope."""
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["SchemaVersion"], "1")
+        self.assertIn("GeneratedAt", result)
+
+    def _assert_array_envelope(self, result, expected_items):
+        """Assert array-style envelope with Items and Count."""
+        self._assert_envelope(result)
+        self.assertEqual(result["Count"], len(expected_items))
+        self.assertEqual(result["Items"], expected_items)
+
     @patch("umi_mcp.server.get_disk", return_value=[{"MountPoint": "/"}])
     def test_server_exposes_disk_tool(self, mock_fn):
         result = get_umi_disk()
-        self.assertEqual(result, [{"MountPoint": "/"}])
+        self._assert_array_envelope(result, [{"MountPoint": "/"}])
         mock_fn.assert_called_once_with()
 
     @patch("umi_mcp.server.get_network", return_value=[{"InterfaceName": "eth0"}])
     def test_server_exposes_network_tool(self, mock_fn):
         result = get_umi_network(include_down=True)
-        self.assertEqual(result, [{"InterfaceName": "eth0"}])
+        self._assert_array_envelope(result, [{"InterfaceName": "eth0"}])
         mock_fn.assert_called_once_with(include_down=True)
 
     @patch("umi_mcp.server.get_process", return_value=[{"ProcessName": "python"}])
     def test_server_exposes_process_tool(self, mock_fn):
         result = get_umi_process(name="python", top=5)
-        self.assertEqual(result, [{"ProcessName": "python"}])
+        self._assert_array_envelope(result, [{"ProcessName": "python"}])
         mock_fn.assert_called_once_with(name="python", top=5)
 
     @patch("umi_mcp.server.get_uptime", return_value={"Hostname": "host1"})
     def test_server_exposes_uptime_tool(self, mock_fn):
         result = get_umi_uptime()
-        self.assertEqual(result, {"Hostname": "host1"})
+        self._assert_envelope(result)
+        self.assertEqual(result["Hostname"], "host1")
         mock_fn.assert_called_once_with()
 
     @patch("umi_mcp.server.get_user", return_value=[{"Username": "alice"}])
     def test_server_exposes_user_tool(self, mock_fn):
         result = get_umi_user(current_only=True)
-        self.assertEqual(result, [{"Username": "alice"}])
+        self._assert_array_envelope(result, [{"Username": "alice"}])
         mock_fn.assert_called_once_with(current_only=True)
 
     @patch("umi_mcp.server.get_service", return_value=[{"ServiceName": "sshd"}])
     def test_server_exposes_service_tool(self, mock_fn):
         result = get_umi_service(name="ssh", status="Running")
-        self.assertEqual(result, [{"ServiceName": "sshd"}])
+        self._assert_array_envelope(result, [{"ServiceName": "sshd"}])
         mock_fn.assert_called_once_with(name="ssh", status="Running")
 
     @patch("umi_mcp.server.get_events", return_value=[])
@@ -424,7 +439,7 @@ class ServerToolRegistrationTests(unittest.TestCase):
     @patch("umi_mcp.server.get_uptime", return_value={"Hostname": "host1"})
     def test_server_exposes_summary_tool(self, mock_uptime, mock_disk, mock_process, mock_events):
         result = get_umi_summary()
-        self.assertIsInstance(result, dict)
+        self._assert_envelope(result)
         mock_uptime.assert_called_once_with()
         mock_disk.assert_called_once_with()
         mock_process.assert_called_once_with()
@@ -1506,6 +1521,249 @@ class MainEntryPointTests(unittest.TestCase):
         with patch("umi_mcp.server.mcp.run") as mock_run:
             runpy.run_module("umi_mcp", run_name="__main__", alter_sys=True)
         mock_run.assert_called_once_with()
+
+
+_NOW_RC = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+
+_PROCESSES_RC = [
+    {"ProcessName": "chrome",  "ProcessId": 10, "CpuPercent": 80.0, "MemoryBytes": 2_000_000_000},
+    {"ProcessName": "idle",    "ProcessId": 20, "CpuPercent": 1.0,  "MemoryBytes": 50_000_000},
+]
+_SERVICES_RC = [
+    {"ServiceName": "svcA", "DisplayName": "Service A", "Status": "Stopped",  "StartType": "Automatic"},
+    {"ServiceName": "svcB", "DisplayName": "Service B", "Status": "Running",  "StartType": "Automatic"},
+    {"ServiceName": "svcC", "DisplayName": "Service C", "Status": "Degraded", "StartType": "Automatic"},
+    {"ServiceName": "svcD", "DisplayName": "Service D", "Status": "Stopped",  "StartType": "Manual"},
+]
+_DISKS_RC = [
+    {"DeviceName": "C:", "MountPoint": "C:\\", "UsedPercent": 90.0, "FreeBytes": 10_000_000},
+    {"DeviceName": "D:", "MountPoint": "D:\\", "UsedPercent": 50.0, "FreeBytes": 500_000_000},
+]
+_UPTIME_RC = {"Hostname": "testhost"}
+
+
+class EventSummaryToolTests(unittest.TestCase):
+    """Tests for get_umi_event_summary (Issue #5)."""
+
+    def _call(self, raw_events=None, now=None, **kwargs):
+        if raw_events is None:
+            raw_events = []
+        mock_now = now or _NOW_RC
+        with patch("umi_mcp.server.get_events", return_value=raw_events), \
+             patch("umi_mcp.server.datetime") as mock_dt:
+            mock_dt.now.return_value = mock_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.timezone = timezone
+            return get_umi_event_summary(**kwargs)
+
+    def test_returns_dict_with_envelope(self):
+        result = self._call()
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["SchemaVersion"], "1")
+        self.assertIn("GeneratedAt", result)
+
+    def test_required_shape_fields(self):
+        result = self._call()
+        for field in ("LookbackHours", "Level", "Count", "Groups"):
+            self.assertIn(field, result, msg=f"Missing: {field}")
+
+    def test_empty_events_yields_zero_groups(self):
+        result = self._call()
+        self.assertEqual(result["Count"], 0)
+        self.assertEqual(result["Groups"], [])
+
+    def test_single_event_creates_one_group(self):
+        events = [
+            {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+             "Source": "Disk", "EventId": 51, "Message": "disk error"},
+        ]
+        result = self._call(raw_events=events)
+        self.assertEqual(result["Count"], 1)
+        g = result["Groups"][0]
+        self.assertEqual(g["Source"], "Disk")
+        self.assertEqual(g["EventId"], 51)
+        self.assertEqual(g["Count"], 1)
+        self.assertEqual(g["SampleMessage"], "disk error")
+
+    def test_repeated_events_are_grouped(self):
+        events = [
+            {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+             "Source": "Disk", "EventId": 51, "Message": "disk error"},
+            {"Timestamp": "2026-03-16T10:00:00+00:00", "Level": "Error",
+             "Source": "Disk", "EventId": 51, "Message": "disk error again"},
+        ]
+        result = self._call(raw_events=events)
+        self.assertEqual(result["Count"], 1)
+        self.assertEqual(result["Groups"][0]["Count"], 2)
+
+    def test_groups_sorted_by_count_descending(self):
+        events = [
+            {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Warning",
+             "Source": "A", "EventId": 1, "Message": "msg"},
+            {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+             "Source": "B", "EventId": 2, "Message": "msg"},
+            {"Timestamp": "2026-03-16T10:00:00+00:00", "Level": "Error",
+             "Source": "B", "EventId": 2, "Message": "msg"},
+        ]
+        result = self._call(raw_events=events)
+        self.assertEqual(result["Groups"][0]["Source"], "B")
+        self.assertEqual(result["Groups"][0]["Count"], 2)
+
+    def test_events_outside_window_excluded(self):
+        events = [
+            {"Timestamp": "2026-03-14T10:00:00+00:00", "Level": "Error",
+             "Source": "Old", "EventId": 1, "Message": "old"},
+            {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+             "Source": "Recent", "EventId": 2, "Message": "recent"},
+        ]
+        result = self._call(raw_events=events, lookback_hours=24)
+        self.assertEqual(result["Count"], 1)
+        self.assertEqual(result["Groups"][0]["Source"], "Recent")
+
+    def test_top_limits_groups_returned(self):
+        events = [
+            {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+             "Source": f"src{i}", "EventId": i, "Message": f"msg{i}"}
+            for i in range(10)
+        ]
+        result = self._call(raw_events=events, top=3)
+        self.assertEqual(result["Count"], 3)
+        self.assertEqual(len(result["Groups"]), 3)
+
+    def test_default_lookback_and_level_in_response(self):
+        result = self._call()
+        self.assertEqual(result["LookbackHours"], 24)
+        self.assertEqual(result["Level"], "Warning")
+
+
+class RecentChangesToolTests(unittest.TestCase):
+    """Tests for get_umi_recent_changes (Issue #11)."""
+
+    def _call(self, uptime=None, processes=None, disks=None, services=None,
+              events=None, now=None, **kwargs):
+        mock_now = now or _NOW_RC
+        with patch("umi_mcp.server.get_uptime",  return_value=_UPTIME_RC if uptime is None else uptime), \
+             patch("umi_mcp.server.get_process", return_value=_PROCESSES_RC if processes is None else processes), \
+             patch("umi_mcp.server.get_disk",    return_value=_DISKS_RC if disks is None else disks), \
+             patch("umi_mcp.server.get_service", return_value=_SERVICES_RC if services is None else services), \
+             patch("umi_mcp.server.get_events",  return_value=[] if events is None else events), \
+             patch("umi_mcp.server.datetime") as mock_dt:
+            mock_dt.now.return_value = mock_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.timezone = timezone
+            return get_umi_recent_changes(**kwargs)
+
+    def test_returns_dict_with_envelope(self):
+        result = self._call()
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["SchemaVersion"], "1")
+        self.assertIn("GeneratedAt", result)
+
+    def test_required_shape_fields(self):
+        result = self._call()
+        for field in ("LookbackHours", "Hostname", "Highlights", "Changes"):
+            self.assertIn(field, result, msg=f"Missing: {field}")
+        for bucket in ("ProcessSpikes", "ServiceCrashes", "BurstEvents", "StorageAlerts"):
+            self.assertIn(bucket, result["Changes"], msg=f"Missing Changes.{bucket}")
+
+    def test_default_lookback_hours(self):
+        result = self._call()
+        self.assertEqual(result["LookbackHours"], 4)
+
+    def test_hostname_from_uptime(self):
+        result = self._call()
+        self.assertEqual(result["Hostname"], "testhost")
+
+    def test_process_spike_high_cpu(self):
+        # chrome has 80% CPU > 50 threshold
+        result = self._call()
+        spikes = result["Changes"]["ProcessSpikes"]
+        spike_names = [p["ProcessName"] for p in spikes]
+        self.assertIn("chrome", spike_names)
+
+    def test_process_spike_high_memory(self):
+        # chrome has 2GB > 1GB threshold
+        result = self._call()
+        spikes = result["Changes"]["ProcessSpikes"]
+        chrome_spike = next(p for p in spikes if p["ProcessName"] == "chrome")
+        self.assertIn("HighMemory", chrome_spike["Reasons"])
+
+    def test_idle_process_not_spiked(self):
+        result = self._call()
+        spikes = result["Changes"]["ProcessSpikes"]
+        self.assertNotIn("idle", [p["ProcessName"] for p in spikes])
+
+    def test_service_crashes_only_automatic_stopped_degraded(self):
+        result = self._call()
+        crashes = result["Changes"]["ServiceCrashes"]
+        crash_names = {s["ServiceName"] for s in crashes}
+        # svcA (Automatic+Stopped) and svcC (Automatic+Degraded) should be included
+        self.assertIn("svcA", crash_names)
+        self.assertIn("svcC", crash_names)
+        # svcB (Running) and svcD (Manual+Stopped) should not be included
+        self.assertNotIn("svcB", crash_names)
+        self.assertNotIn("svcD", crash_names)
+
+    def test_storage_alerts_above_threshold(self):
+        result = self._call()
+        alerts = result["Changes"]["StorageAlerts"]
+        alert_devices = [a["DeviceName"] for a in alerts]
+        self.assertIn("C:", alert_devices)
+        self.assertNotIn("D:", alert_devices)
+
+    def test_burst_events_grouped_by_source(self):
+        # 3 identical events should trigger burst threshold
+        ts = "2026-03-16T11:30:00+00:00"
+        events = [
+            {"Timestamp": ts, "Source": "SomeSource", "EventId": 100,
+             "Level": "Warning", "Message": "burst"}
+        ] * 3
+        result = self._call(events=events)
+        bursts = result["Changes"]["BurstEvents"]
+        self.assertEqual(len(bursts), 1)
+        self.assertEqual(bursts[0]["Source"], "SomeSource")
+        self.assertEqual(bursts[0]["Count"], 3)
+
+    def test_highlights_non_empty(self):
+        result = self._call()
+        self.assertIsInstance(result["Highlights"], list)
+        self.assertGreater(len(result["Highlights"]), 0)
+
+    def test_highlights_all_clear_when_no_issues(self):
+        result = self._call(
+            processes=[{"ProcessName": "idle", "ProcessId": 1, "CpuPercent": 0.1, "MemoryBytes": 10_000}],
+            services=[{"ServiceName": "svcB", "DisplayName": "B", "Status": "Running", "StartType": "Automatic"}],
+            disks=[{"DeviceName": "C:", "MountPoint": "C:\\", "UsedPercent": 50.0, "FreeBytes": 500_000_000}],
+            events=[],
+        )
+        self.assertEqual(result["Highlights"], ["No significant changes detected."])
+
+    def test_highlights_mentions_spike_process(self):
+        result = self._call()
+        combined = " ".join(result["Highlights"])
+        self.assertIn("chrome", combined)
+
+    def test_service_exception_falls_back_to_empty_crashes(self):
+        with patch("umi_mcp.server.get_uptime",  return_value=_UPTIME_RC), \
+             patch("umi_mcp.server.get_process", return_value=[]), \
+             patch("umi_mcp.server.get_disk",    return_value=[]), \
+             patch("umi_mcp.server.get_service", side_effect=PermissionError("access denied")), \
+             patch("umi_mcp.server.get_events",  return_value=[]), \
+             patch("umi_mcp.server.datetime") as mock_dt:
+            mock_dt.now.return_value = _NOW_RC
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.timezone = timezone
+            result = get_umi_recent_changes()
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["Changes"]["ServiceCrashes"], [])
+
+    def test_storage_alert_highlight_uses_mountpoint_when_devicename_none(self):
+        disks = [{"DeviceName": None, "MountPoint": "/mnt/data",
+                  "UsedPercent": 91.0, "FreeBytes": 1_000_000}]
+        result = self._call(disks=disks, processes=[], services=[])
+        combined = " ".join(result["Highlights"])
+        self.assertIn("/mnt/data", combined)
+        self.assertNotIn("None", combined)
 
 
 if __name__ == "__main__":

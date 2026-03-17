@@ -170,7 +170,11 @@ class EventsToolTests(unittest.TestCase):
     def test_server_exposes_events_tool(self, mock_get_events):
         result = get_umi_events(level="Error", source="Disk", last_n=3)
 
-        self.assertEqual(result, [{"Level": "Error"}])
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["SchemaVersion"], "1")
+        self.assertIn("GeneratedAt", result)
+        self.assertEqual(result["Count"], 1)
+        self.assertEqual(result["Items"], [{"Level": "Error"}])
         mock_get_events.assert_called_once_with(level="Error", source="Disk", last_n=3)
 
 
