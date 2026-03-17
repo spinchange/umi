@@ -6,6 +6,10 @@ import subprocess
 
 import psutil
 
+_NETWORK_FS = {"smb", "cifs", "nfs", "nfs4", "afpfs", "davfs", "sshfs", "fuse.sshfs", "ncpfs", "afs"}
+_REMOVABLE_FS = {"iso9660", "udf", "cdfs", "udf"}
+_VIRTUAL_FS = {"tmpfs", "ramfs", "zfs", "fuse", "fuseblk"}
+
 PSEUDO_FS = {
     "tmpfs", "devtmpfs", "proc", "sysfs", "devpts", "cgroup", "cgroup2",
     "overlay", "shm", "udev", "squashfs", "efivarfs", "bpf", "tracefs",
@@ -23,6 +27,28 @@ IO_FIELD_NAMES = (
     "ReadTimeMs",
     "WriteTimeMs",
 )
+
+
+def _classify_volume_type(part) -> str:
+    opts = (getattr(part, "opts", "") or "").lower()
+    fstype = (part.fstype or "").lower()
+    device = (part.device or "").lower()
+
+    if fstype in _NETWORK_FS or "remote" in opts:
+        return "Network"
+    if fstype in _REMOVABLE_FS or "cdrom" in opts:
+        return "Removable"
+    if "removable" in opts:
+        return "Removable"
+    if fstype in _VIRTUAL_FS or device.startswith("zfs"):
+        return "Virtual"
+    return "Fixed"
+
+
+def _is_removable(part) -> bool:
+    opts = (getattr(part, "opts", "") or "").lower()
+    fstype = (part.fstype or "").lower()
+    return "cdrom" in opts or "removable" in opts or fstype in _REMOVABLE_FS
 
 
 def _null_io_fields() -> dict:
@@ -217,11 +243,12 @@ def get_disk() -> list[dict]:
             "DeviceName": part.device,
             "MountPoint": part.mountpoint,
             "FileSystem": part.fstype.upper() if part.fstype else "Unknown",
+            "VolumeType": _classify_volume_type(part),
             "TotalBytes": usage.total,
             "UsedBytes": usage.used,
             "FreeBytes": usage.free,
             "UsedPercent": used_pct,
-            "IsRemovable": False,
+            "IsRemovable": _is_removable(part),
             "Label": label,
             **_extract_io_fields(io_counter),
         })

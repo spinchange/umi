@@ -11,6 +11,7 @@ from unittest.mock import patch, MagicMock
 
 from umi_mcp.server import (
     get_umi_disk,
+    get_umi_events,
     get_umi_network,
     get_umi_process,
     get_umi_uptime,
@@ -1521,6 +1522,213 @@ class MainEntryPointTests(unittest.TestCase):
         with patch("umi_mcp.server.mcp.run") as mock_run:
             runpy.run_module("umi_mcp", run_name="__main__", alter_sys=True)
         mock_run.assert_called_once_with()
+
+
+class GoldenShapeTests(unittest.TestCase):
+    """Regression-protect the response shapes of all envelope endpoints."""
+
+    _ARRAY_KEYS = frozenset({"SchemaVersion", "GeneratedAt", "Count", "Items"})
+    _FLAT_ENV_KEYS = frozenset({"SchemaVersion", "GeneratedAt"})
+
+    # --- array envelope shape ---
+
+    @patch("umi_mcp.server.get_disk", return_value=[])
+    def test_disk_envelope_exact_keys(self, _):
+        result = get_umi_disk()
+        self.assertEqual(set(result.keys()) & self._ARRAY_KEYS, self._ARRAY_KEYS)
+        self.assertIsInstance(result["Items"], list)
+        self.assertIsInstance(result["Count"], int)
+
+    @patch("umi_mcp.server.get_network", return_value=[])
+    def test_network_envelope_exact_keys(self, _):
+        result = get_umi_network()
+        self.assertEqual(set(result.keys()) & self._ARRAY_KEYS, self._ARRAY_KEYS)
+
+    @patch("umi_mcp.server.get_process", return_value=[])
+    def test_process_envelope_exact_keys(self, _):
+        result = get_umi_process()
+        self.assertEqual(set(result.keys()) & self._ARRAY_KEYS, self._ARRAY_KEYS)
+
+    @patch("umi_mcp.server.get_user", return_value=[])
+    def test_user_envelope_exact_keys(self, _):
+        result = get_umi_user()
+        self.assertEqual(set(result.keys()) & self._ARRAY_KEYS, self._ARRAY_KEYS)
+
+    @patch("umi_mcp.server.get_service", return_value=[])
+    def test_service_envelope_exact_keys(self, _):
+        result = get_umi_service()
+        self.assertEqual(set(result.keys()) & self._ARRAY_KEYS, self._ARRAY_KEYS)
+
+    @patch("umi_mcp.server.get_events", return_value=[])
+    def test_events_envelope_exact_keys(self, _):
+        result = get_umi_events()
+        self.assertEqual(set(result.keys()) & self._ARRAY_KEYS, self._ARRAY_KEYS)
+
+    # --- flat dict envelope ---
+
+    @patch("umi_mcp.server.get_uptime", return_value={"Hostname": "h", "OS": "Linux"})
+    def test_uptime_has_envelope_fields(self, _):
+        result = get_umi_uptime()
+        for key in self._FLAT_ENV_KEYS:
+            self.assertIn(key, result)
+        self.assertEqual(result["Hostname"], "h")   # domain field survives merge
+
+    # --- event_summary shape ---
+
+    @patch("umi_mcp.server.get_events", return_value=[])
+    @patch("umi_mcp.server.datetime")
+    def test_event_summary_shape(self, mock_dt, _):
+        mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.timezone = timezone
+        result = get_umi_event_summary()
+        expected = {"SchemaVersion", "GeneratedAt", "LookbackHours", "Level", "Count", "Groups"}
+        self.assertEqual(set(result.keys()), expected)
+        self.assertIsInstance(result["Groups"], list)
+
+    @patch("umi_mcp.server.get_events", return_value=[
+        {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+         "Source": "Disk", "EventId": 51, "Message": "err"},
+    ])
+    @patch("umi_mcp.server.datetime")
+    def test_event_summary_group_shape(self, mock_dt, _):
+        mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.timezone = timezone
+        result = get_umi_event_summary()
+        self.assertEqual(result["Count"], 1)
+        group = result["Groups"][0]
+        expected_group_keys = {"Source", "EventId", "Level", "Count", "FirstSeen", "LastSeen", "SampleMessage"}
+        self.assertEqual(set(group.keys()), expected_group_keys)
+
+    # --- recent_changes shape ---
+
+    @patch("umi_mcp.server.get_uptime",  return_value={"Hostname": "h"})
+    @patch("umi_mcp.server.get_process", return_value=[])
+    @patch("umi_mcp.server.get_disk",    return_value=[])
+    @patch("umi_mcp.server.get_service", return_value=[])
+    @patch("umi_mcp.server.get_events",  return_value=[])
+    @patch("umi_mcp.server.datetime")
+    def test_recent_changes_shape(self, mock_dt, *_):
+        mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.timezone = timezone
+        result = get_umi_recent_changes()
+        expected = {"SchemaVersion", "GeneratedAt", "LookbackHours", "Hostname", "Highlights", "Changes"}
+        self.assertEqual(set(result.keys()), expected)
+        changes = result["Changes"]
+        self.assertEqual(set(changes.keys()), {"ProcessSpikes", "ServiceCrashes", "BurstEvents", "StorageAlerts"})
+        self.assertIsInstance(result["Highlights"], list)
+
+    @patch("umi_mcp.server.get_uptime",  return_value={"Hostname": "h"})
+    @patch("umi_mcp.server.get_process", return_value=[
+        {"ProcessName": "heavy", "ProcessId": 1, "CpuPercent": 95.0, "MemoryBytes": 2_000_000_000},
+    ])
+    @patch("umi_mcp.server.get_disk",    return_value=[])
+    @patch("umi_mcp.server.get_service", return_value=[])
+    @patch("umi_mcp.server.get_events",  return_value=[])
+    @patch("umi_mcp.server.datetime")
+    def test_process_spike_item_shape(self, mock_dt, *_):
+        mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.timezone = timezone
+        result = get_umi_recent_changes()
+        spike = result["Changes"]["ProcessSpikes"][0]
+        expected = {"ProcessName", "ProcessId", "CpuPercent", "MemoryBytes", "Reasons"}
+        self.assertEqual(set(spike.keys()), expected)
+        self.assertIsInstance(spike["Reasons"], list)
+
+    @patch("umi_mcp.server.get_uptime",  return_value={"Hostname": "h"})
+    @patch("umi_mcp.server.get_process", return_value=[])
+    @patch("umi_mcp.server.get_disk",    return_value=[])
+    @patch("umi_mcp.server.get_service", return_value=[
+        {"ServiceName": "svc", "DisplayName": "Svc", "Status": "Stopped", "StartType": "Automatic"},
+    ])
+    @patch("umi_mcp.server.get_events",  return_value=[])
+    @patch("umi_mcp.server.datetime")
+    def test_service_crash_item_shape(self, mock_dt, *_):
+        mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.timezone = timezone
+        result = get_umi_recent_changes()
+        crash = result["Changes"]["ServiceCrashes"][0]
+        expected = {"ServiceName", "DisplayName", "Status"}
+        self.assertEqual(set(crash.keys()), expected)
+
+
+class VerbosityTests(unittest.TestCase):
+    """Tests for Issue #3 verbosity controls on process, service, and events."""
+
+    @patch("umi_mcp.server.get_process", return_value=[{
+        "ProcessName": "chrome", "ProcessId": 1, "CpuPercent": 10.0,
+        "MemoryBytes": 500_000, "Status": "Running",
+        "ThreadCount": 40, "CommandLine": "/usr/bin/chrome",
+    }])
+    def test_process_summary_strips_to_core_fields(self, _):
+        result = get_umi_process(verbosity="summary")
+        item = result["Items"][0]
+        self.assertEqual(set(item.keys()), {"ProcessName", "ProcessId", "CpuPercent", "MemoryBytes", "Status"})
+
+    @patch("umi_mcp.server.get_process", return_value=[{
+        "ProcessName": "chrome", "ProcessId": 1, "CpuPercent": 10.0,
+        "MemoryBytes": 500_000, "Status": "Running", "ThreadCount": 40,
+    }])
+    def test_process_full_preserves_all_fields(self, _):
+        result = get_umi_process(verbosity="full")
+        item = result["Items"][0]
+        self.assertIn("ThreadCount", item)
+
+    @patch("umi_mcp.server.get_service", return_value=[{
+        "ServiceName": "sshd", "Status": "Running", "StartType": "Automatic",
+        "DisplayName": "SSH Daemon", "Description": "Provides SSH", "ProcessId": 999,
+    }])
+    def test_service_summary_strips_to_core_fields(self, _):
+        result = get_umi_service(verbosity="summary")
+        item = result["Items"][0]
+        self.assertEqual(set(item.keys()), {"ServiceName", "Status", "StartType"})
+
+    @patch("umi_mcp.server.get_service", return_value=[
+        {"ServiceName": f"svc{i}", "Status": "Running", "StartType": "Automatic"}
+        for i in range(10)
+    ])
+    def test_service_top_limits_results(self, _):
+        result = get_umi_service(top=3)
+        self.assertEqual(result["Count"], 3)
+        self.assertEqual(len(result["Items"]), 3)
+
+    @patch("umi_mcp.server.get_service", return_value=[
+        {"ServiceName": f"svc{i}", "Status": "Running", "StartType": "Automatic"}
+        for i in range(5)
+    ])
+    def test_service_top_none_returns_all(self, _):
+        result = get_umi_service(top=None)
+        self.assertEqual(result["Count"], 5)
+
+    @patch("umi_mcp.server.get_events", return_value=[{
+        "Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+        "Source": "Disk", "Message": "err", "EventId": 51,
+        "LogName": "System", "User": None, "MachineName": "host",
+    }])
+    def test_events_summary_strips_to_core_fields(self, _):
+        result = get_umi_events(verbosity="summary")
+        item = result["Items"][0]
+        self.assertEqual(set(item.keys()), {"Timestamp", "Level", "Source", "Message"})
+
+    @patch("umi_mcp.server.get_events", return_value=[{
+        "Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+        "Source": "Disk", "Message": "err", "EventId": 51, "LogName": "System",
+    }])
+    def test_events_full_preserves_all_fields(self, _):
+        result = get_umi_events(verbosity="full")
+        item = result["Items"][0]
+        self.assertIn("EventId", item)
+        self.assertIn("LogName", item)
+
+    @patch("umi_mcp.server.get_process", return_value=[])
+    def test_unknown_verbosity_value_treated_as_full(self, _):
+        # Unknown verbosity falls through to the identity path (not summary)
+        result = get_umi_process(verbosity="compact")
+        self.assertIsInstance(result["Items"], list)
 
 
 _NOW_RC = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)

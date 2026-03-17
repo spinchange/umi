@@ -13,6 +13,12 @@ mcp = FastMCP("umi")
 
 _SCHEMA_VERSION = "1"
 
+# Summary-mode field sets for verbosity="summary".
+# These are the minimum fields an agent needs to triage each resource type.
+_PROCESS_SUMMARY_FIELDS = frozenset({"ProcessName", "ProcessId", "CpuPercent", "MemoryBytes", "Status"})
+_SERVICE_SUMMARY_FIELDS = frozenset({"ServiceName", "Status", "StartType"})
+_EVENTS_SUMMARY_FIELDS  = frozenset({"Timestamp", "Level", "Source", "Message"})
+
 _LEVEL_ORDER = {
     "Critical": 0,
     "Error": 1,
@@ -21,6 +27,13 @@ _LEVEL_ORDER = {
     "Verbose": 4,
     "Unknown": 5,
 }
+
+
+def _apply_verbosity(items: list[dict], verbosity: str, summary_fields: frozenset) -> list[dict]:
+    """Strip items to summary_fields when verbosity='summary'. No-op for 'full'."""
+    if verbosity == "summary":
+        return [{k: v for k, v in item.items() if k in summary_fields} for item in items]
+    return items
 
 
 def _wrap(data: "dict | list") -> dict:
@@ -68,15 +81,18 @@ def get_umi_network(include_down: bool = False) -> dict:
 
 
 @mcp.tool()
-def get_umi_process(name: str = None, top: int = None) -> dict:
+def get_umi_process(name: str = None, top: int = None, verbosity: str = "full") -> dict:
     """
     Returns running processes sorted by CPU usage descending.
     Use name to filter by process name substring (e.g. name="python").
     Use top to limit results (e.g. top=10 for the 10 most CPU-intensive processes).
     MemoryBytes is resident set size. CpuPercent may exceed 100 on multi-core systems.
+    verbosity="summary" returns only ProcessName, ProcessId, CpuPercent, MemoryBytes, Status.
+    verbosity="full" (default) returns all fields.
     Response includes SchemaVersion, GeneratedAt, Count, and Items array.
     """
-    return _wrap(get_process(name=name, top=top))
+    data = get_process(name=name, top=top)
+    return _wrap(_apply_verbosity(data, verbosity, _PROCESS_SUMMARY_FIELDS))
 
 
 @mcp.tool()
@@ -102,14 +118,20 @@ def get_umi_user(current_only: bool = False) -> dict:
 
 
 @mcp.tool()
-def get_umi_service(name: str = None, status: str = None) -> dict:
+def get_umi_service(name: str = None, status: str = None, top: int = None, verbosity: str = "full") -> dict:
     """
     Returns system services: Windows Services, systemd units, or launchd agents
     depending on the host OS. Optionally filter by name substring or by status
     (Running, Stopped, Degraded, Starting, Stopping, Paused).
+    Use top to limit the number of returned services (useful on Windows with 200+ services).
+    verbosity="summary" returns only ServiceName, Status, StartType.
+    verbosity="full" (default) returns all fields.
     Response includes SchemaVersion, GeneratedAt, Count, and Items array.
     """
-    return _wrap(get_service(name=name, status=status))
+    data = get_service(name=name, status=status)
+    if top is not None:
+        data = data[:top]
+    return _wrap(_apply_verbosity(data, verbosity, _SERVICE_SUMMARY_FIELDS))
 
 
 @mcp.tool()
@@ -188,16 +210,19 @@ def get_umi_summary(error_lookback_hours: int = 24) -> dict:
 
 
 @mcp.tool()
-def get_umi_events(level: str = "Error", source: str = None, last_n: int = 20) -> dict:
+def get_umi_events(level: str = "Error", source: str = None, last_n: int = 20, verbosity: str = "full") -> dict:
     """
     Returns recent system events/log entries normalized across Windows Event Log,
     Linux journald, and macOS unified logging. Filter by severity level, optional
     source substring, and limit the number of returned entries with last_n.
     Valid level values: Info, Warning, Error, Critical (default: Error).
     Message is truncated to 500 characters.
+    verbosity="summary" returns only Timestamp, Level, Source, Message.
+    verbosity="full" (default) returns all fields including LogName, EventId, User, etc.
     Response includes SchemaVersion, GeneratedAt, Count, and Items array.
     """
-    return _wrap(get_events(level=level, source=source, last_n=last_n))
+    data = get_events(level=level, source=source, last_n=last_n)
+    return _wrap(_apply_verbosity(data, verbosity, _EVENTS_SUMMARY_FIELDS))
 
 
 @mcp.tool()

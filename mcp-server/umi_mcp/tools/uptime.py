@@ -75,7 +75,7 @@ def get_uptime() -> dict:
         "Hostname": socket.gethostname(),
         "OS": OS_MAP.get(os_name, os_name),
         "OSVersion": os_version,
-        "Architecture": ARCH_MAP.get(platform.machine(), platform.machine()),
+        "Architecture": ARCH_MAP.get(platform.machine(), "Unknown"),
         "BootTime": boot_dt.isoformat(),
         "UptimeSeconds": uptime_secs,
         "UptimeHuman": f"{days}d {hours}h {minutes}m",
