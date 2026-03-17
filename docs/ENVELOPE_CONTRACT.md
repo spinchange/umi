@@ -135,6 +135,18 @@ for item in items:
 
 `Count` equals `len(result["Items"])` and is provided for cheap size checks without iterating `Items`.
 
+## Platform Notes
+
+### DNS servers (network endpoint)
+
+`DnsServers` is populated per-interface on **Windows** (via `Get-DnsClientServerAddress`). On **Linux** and **macOS** the same system-wide resolver list is applied to all Up interfaces — per-interface DNS is not yet distinguished on those platforms.
+
+On Linux systems running **systemd-resolved** (common on Ubuntu, Debian, Fedora), `/etc/resolv.conf` typically points to a local stub (`127.0.0.53`). UMI automatically reads from `/run/systemd/resolve/resolv.conf` first to surface the real upstream resolvers. If only stub addresses are found they are returned as-is.
+
+### Default gateway (network endpoint)
+
+`DefaultGateway` is assigned to the interface identified as the system's lowest-metric default route. All other interfaces get `null`. When a VPN is active it may become the default route interface; the physical interface's `DefaultGateway` will then be `null` until the VPN disconnects.
+
 ## SchemaVersion
 
 - Current value: `"1"`

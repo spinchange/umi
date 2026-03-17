@@ -48,7 +48,30 @@ def _classify_volume_type(part) -> str:
 def _is_removable(part) -> bool:
     opts = (getattr(part, "opts", "") or "").lower()
     fstype = (part.fstype or "").lower()
-    return "cdrom" in opts or "removable" in opts or fstype in _REMOVABLE_FS
+
+    if "cdrom" in opts or "removable" in opts or fstype in _REMOVABLE_FS:
+        return True
+
+    # Linux: authoritative source is /sys/class/block/<dev>/removable
+    if platform.system() == "Linux":
+        device = (part.device or "").split("/")[-1]
+        # Strip partition suffix to get the block device name (e.g. sda1 → sda)
+        sysfs_candidates = [device]
+        import re as _re
+        base = _re.sub(r"\d+$", "", device)
+        if base and base != device:
+            sysfs_candidates.append(base)
+        for dev_name in sysfs_candidates:
+            removable_path = f"/sys/class/block/{dev_name}/removable"
+            try:
+                with open(removable_path) as f:
+                    if f.read().strip() == "1":
+                        return True
+                break
+            except OSError:
+                continue
+
+    return False
 
 
 def _null_io_fields() -> dict:

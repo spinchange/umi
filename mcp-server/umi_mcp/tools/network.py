@@ -23,7 +23,7 @@ def _load_default_gateway_windows() -> tuple[str | None, str | None]:
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
             capture_output=True, text=True, timeout=_GATEWAY_TIMEOUT, check=False,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None, None
     if out.returncode != 0 or not out.stdout.strip():
         return None, None
@@ -51,7 +51,7 @@ def _load_dns_servers_windows() -> dict[str, list[str]]:
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
             capture_output=True, text=True, timeout=_DNS_TIMEOUT, check=False,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return {}
     if out.returncode != 0 or not out.stdout.strip():
         return {}
@@ -79,7 +79,7 @@ def _load_default_gateway_linux() -> tuple[str | None, str | None]:
             ["ip", "route", "show", "default"],
             capture_output=True, text=True, timeout=_GATEWAY_TIMEOUT, check=False,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None, None
     for line in out.stdout.splitlines():
         parts = line.split()
@@ -95,13 +95,27 @@ def _load_default_gateway_linux() -> tuple[str | None, str | None]:
 
 
 def _load_dns_servers_resolv() -> list[str]:
-    """Parse nameserver lines from /etc/resolv.conf."""
-    try:
-        with open("/etc/resolv.conf", "r") as f:
-            content = f.read()
-    except OSError:
-        return []
-    return re.findall(r"^nameserver\s+(\S+)", content, re.MULTILINE)
+    """Parse nameserver lines from resolv.conf.
+
+    On systemd-resolved systems /etc/resolv.conf points to a local stub
+    (127.0.0.53). We try the real upstream resolver file first.
+    """
+    _STUB_ADDRS = {"127.0.0.1", "127.0.0.53", "::1"}
+
+    for path in ("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"):
+        try:
+            with open(path) as f:
+                content = f.read()
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        servers = re.findall(r"^nameserver\s+(\S+)", content, re.MULTILINE)
+        real = [s for s in servers if s not in _STUB_ADDRS]
+        if real:
+            return real
+        if servers:
+            return servers  # all stubs — return them rather than nothing
+
+    return []
 
 
 def _load_default_gateway_macos() -> tuple[str | None, str | None]:
@@ -111,7 +125,7 @@ def _load_default_gateway_macos() -> tuple[str | None, str | None]:
             ["route", "-n", "get", "default"],
             capture_output=True, text=True, timeout=_GATEWAY_TIMEOUT, check=False,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None, None
     gw = None
     iface = None
@@ -131,7 +145,7 @@ def _load_dns_servers_scutil() -> list[str]:
             ["scutil", "--dns"],
             capture_output=True, text=True, timeout=_DNS_TIMEOUT, check=False,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return []
     servers = re.findall(r"nameserver\[\d+\]\s*:\s*(\S+)", out.stdout)
     seen: set[str] = set()

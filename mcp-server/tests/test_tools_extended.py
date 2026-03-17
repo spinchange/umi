@@ -20,6 +20,8 @@ from umi_mcp.server import (
     get_umi_summary,
     get_umi_event_summary,
     get_umi_recent_changes,
+    get_umi_service_health,
+    get_umi_triage_bundle,
 )
 from umi_mcp.tools import disk, uptime, network, process, service, user, events
 
@@ -1685,7 +1687,7 @@ class VerbosityTests(unittest.TestCase):
     def test_service_summary_strips_to_core_fields(self, _):
         result = get_umi_service(verbosity="summary")
         item = result["Items"][0]
-        self.assertEqual(set(item.keys()), {"ServiceName", "Status", "StartType"})
+        self.assertEqual(set(item.keys()), {"ServiceName", "DisplayName", "Status", "StartType"})
 
     @patch("umi_mcp.server.get_service", return_value=[
         {"ServiceName": f"svc{i}", "Status": "Running", "StartType": "Automatic"}
@@ -1972,6 +1974,256 @@ class RecentChangesToolTests(unittest.TestCase):
         combined = " ".join(result["Highlights"])
         self.assertIn("/mnt/data", combined)
         self.assertNotIn("None", combined)
+
+
+_SERVICES_HEALTH = [
+    {"ServiceName": "spooler", "DisplayName": "Print Spooler", "Status": "Stopped",  "StartType": "Automatic"},
+    {"ServiceName": "wuauserv", "DisplayName": "Windows Update",  "Status": "Running",  "StartType": "Automatic"},
+    {"ServiceName": "bits",    "DisplayName": "BITS",             "Status": "Degraded", "StartType": "Automatic"},
+]
+
+_SCM_EVENTS = [
+    # spooler crash at 11:00
+    {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+     "Source": "Service Control Manager", "EventId": 7034,
+     "Message": "The Print Spooler service terminated unexpectedly."},
+    # spooler crash again at 10:00
+    {"Timestamp": "2026-03-16T10:00:00+00:00", "Level": "Error",
+     "Source": "Service Control Manager", "EventId": 7034,
+     "Message": "The Print Spooler service terminated unexpectedly."},
+    # spooler state change to running at 09:00
+    {"Timestamp": "2026-03-16T09:00:00+00:00", "Level": "Information",
+     "Source": "Service Control Manager", "EventId": 7036,
+     "Message": "The Print Spooler service entered the running state."},
+]
+
+
+class ServiceHealthToolTests(unittest.TestCase):
+    """Tests for get_umi_service_health (Issue #9)."""
+
+    def _call(self, services=None, events=None, platform_sys="Windows", now=None, **kwargs):
+        mock_now = now or _NOW_RC
+        with patch("umi_mcp.server.get_service", return_value=_SERVICES_HEALTH if services is None else services), \
+             patch("umi_mcp.server.get_events",  return_value=_SCM_EVENTS if events is None else events), \
+             patch("umi_mcp.server.platform.system", return_value=platform_sys), \
+             patch("umi_mcp.server.datetime") as mock_dt:
+            mock_dt.now.return_value = mock_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.timezone = timezone
+            return get_umi_service_health(**kwargs)
+
+    def test_returns_envelope_shape(self):
+        result = self._call()
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["SchemaVersion"], "1")
+        self.assertIn("GeneratedAt", result)
+        self.assertIn("LookbackHours", result)
+        self.assertIn("Count", result)
+        self.assertIn("Services", result)
+
+    def test_service_record_shape(self):
+        result = self._call()
+        rec = next(r for r in result["Services"] if r["ServiceName"] == "spooler")
+        expected = {"ServiceName", "DisplayName", "Status", "StartType",
+                    "IsHealthy", "CrashCount", "RestartCount", "LastCrash", "LastStateChange"}
+        self.assertEqual(set(rec.keys()), expected)
+
+    def test_windows_crash_count_from_scm_events(self):
+        result = self._call()
+        spooler = next(r for r in result["Services"] if r["ServiceName"] == "spooler")
+        self.assertEqual(spooler["CrashCount"], 2)
+
+    def test_windows_restart_count_from_running_state_changes(self):
+        result = self._call()
+        spooler = next(r for r in result["Services"] if r["ServiceName"] == "spooler")
+        self.assertEqual(spooler["RestartCount"], 1)
+
+    def test_windows_last_crash_is_most_recent(self):
+        result = self._call()
+        spooler = next(r for r in result["Services"] if r["ServiceName"] == "spooler")
+        self.assertEqual(spooler["LastCrash"], "2026-03-16T11:00:00+00:00")
+
+    def test_non_windows_crash_count_is_null(self):
+        result = self._call(platform_sys="Linux")
+        for svc in result["Services"]:
+            self.assertIsNone(svc["CrashCount"])
+            self.assertIsNone(svc["RestartCount"])
+            self.assertIsNone(svc["LastCrash"])
+
+    def test_healthy_running_service_flagged_correctly(self):
+        result = self._call()
+        wuauserv = next(r for r in result["Services"] if r["ServiceName"] == "wuauserv")
+        self.assertTrue(wuauserv["IsHealthy"])
+
+    def test_stopped_service_not_healthy(self):
+        result = self._call()
+        spooler = next(r for r in result["Services"] if r["ServiceName"] == "spooler")
+        self.assertFalse(spooler["IsHealthy"])
+
+    def test_only_degraded_filters_healthy_services(self):
+        result = self._call(only_degraded=True)
+        names = {r["ServiceName"] for r in result["Services"]}
+        self.assertNotIn("wuauserv", names)   # wuauserv is Running with no crashes
+        self.assertIn("spooler", names)
+        self.assertIn("bits", names)
+
+    def test_stopped_services_sorted_first(self):
+        result = self._call()
+        statuses = [r["Status"] for r in result["Services"]]
+        # Stopped/Degraded should precede Running
+        running_idx = next(i for i, s in enumerate(statuses) if s == "Running")
+        for i, s in enumerate(statuses):
+            if s in ("Stopped", "Degraded"):
+                self.assertLess(i, running_idx)
+
+    def test_top_limits_results(self):
+        result = self._call(top=2)
+        self.assertLessEqual(result["Count"], 2)
+        self.assertLessEqual(len(result["Services"]), 2)
+
+    def test_events_outside_window_not_counted(self):
+        old_event = {"Timestamp": "2026-03-10T00:00:00+00:00", "Level": "Error",
+                     "Source": "Service Control Manager", "EventId": 7034,
+                     "Message": "The Print Spooler service terminated unexpectedly."}
+        result = self._call(events=[old_event], lookback_hours=24)
+        spooler = next((r for r in result["Services"] if r["ServiceName"] == "spooler"), None)
+        if spooler:
+            self.assertEqual(spooler["CrashCount"], 0)
+
+    def test_no_events_produces_zero_counts(self):
+        result = self._call(events=[])
+        for svc in result["Services"]:
+            self.assertEqual(svc["CrashCount"], 0)
+            self.assertIsNone(svc["LastCrash"])
+
+
+_TRIAGE_UPTIME = {
+    "Hostname": "triagehost", "OS": "Windows", "UptimeSeconds": 7200,
+    "CpuPercentOverall": 25.0, "TotalMemoryBytes": 16_000_000_000,
+    "MemoryUsedBytes": 8_000_000_000, "LoadAverage1m": None,
+}
+_TRIAGE_PROCESSES = [
+    {"ProcessName": "chrome", "ProcessId": 1, "CpuPercent": 40.0,
+     "MemoryBytes": 1_000_000_000, "Status": "Running", "User": "chris"},
+]
+_TRIAGE_DISKS = [
+    {"DeviceName": "C:", "MountPoint": "C:\\", "UsedPercent": 92.0, "FreeBytes": 8_000_000},
+]
+_TRIAGE_SERVICES = [
+    {"ServiceName": "spooler", "DisplayName": "Print Spooler", "Status": "Stopped", "StartType": "Automatic"},
+    {"ServiceName": "bits",    "DisplayName": "BITS",           "Status": "Running",  "StartType": "Automatic"},
+]
+_TRIAGE_EVENTS = [
+    {"Timestamp": "2026-03-16T11:30:00+00:00", "Level": "Error",
+     "Source": "Disk", "EventId": 51, "Message": "disk error"},
+    {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Error",
+     "Source": "Disk", "EventId": 51, "Message": "disk error"},
+]
+
+
+class TriageBundleToolTests(unittest.TestCase):
+    """Tests for get_umi_triage_bundle (Issue #12)."""
+
+    def _call(self, uptime=None, processes=None, disks=None, services=None, events=None, now=None):
+        mock_now = now or _NOW_RC
+        with patch("umi_mcp.server.get_uptime",  return_value=_TRIAGE_UPTIME if uptime is None else uptime), \
+             patch("umi_mcp.server.get_process", return_value=_TRIAGE_PROCESSES if processes is None else processes), \
+             patch("umi_mcp.server.get_disk",    return_value=_TRIAGE_DISKS if disks is None else disks), \
+             patch("umi_mcp.server.get_service", return_value=_TRIAGE_SERVICES if services is None else services), \
+             patch("umi_mcp.server.get_events",  return_value=_TRIAGE_EVENTS if events is None else events), \
+             patch("umi_mcp.server.datetime") as mock_dt:
+            mock_dt.now.return_value = mock_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.timezone = timezone
+            return get_umi_triage_bundle()
+
+    def test_returns_envelope(self):
+        result = self._call()
+        self.assertEqual(result["SchemaVersion"], "1")
+        self.assertIn("GeneratedAt", result)
+
+    def test_required_top_level_fields(self):
+        result = self._call()
+        for field in ("Hostname", "OS", "UptimeSeconds", "CpuPercent", "MemoryUsedPercent",
+                      "LoadAverage1m", "Highlights", "TopProcesses",
+                      "StorageAlerts", "StoppedServices", "TopEvents"):
+            self.assertIn(field, result, msg=f"Missing: {field}")
+
+    def test_identity_fields(self):
+        result = self._call()
+        self.assertEqual(result["Hostname"], "triagehost")
+        self.assertEqual(result["OS"], "Windows")
+
+    def test_memory_percent_computed(self):
+        result = self._call()
+        self.assertAlmostEqual(result["MemoryUsedPercent"], 50.0, places=1)
+
+    def test_top_processes_use_summary_fields(self):
+        result = self._call()
+        proc = result["TopProcesses"][0]
+        self.assertIn("ProcessName", proc)
+        self.assertIn("CpuPercent", proc)
+        self.assertNotIn("CommandLine", proc)   # full field stripped in summary mode
+
+    def test_storage_alerts_above_threshold(self):
+        result = self._call()
+        alerts = result["StorageAlerts"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["DeviceName"], "C:")
+
+    def test_stopped_services_only_automatic(self):
+        result = self._call()
+        stopped = result["StoppedServices"]
+        self.assertEqual(len(stopped), 1)
+        self.assertEqual(stopped[0]["ServiceName"], "spooler")
+
+    def test_top_events_grouped_from_last_4h(self):
+        result = self._call()
+        events = result["TopEvents"]
+        self.assertGreater(len(events), 0)
+        # Both disk events should be grouped into one entry with Count=2
+        disk_event = next((e for e in events if e["Source"] == "Disk"), None)
+        self.assertIsNotNone(disk_event)
+        self.assertEqual(disk_event["Count"], 2)
+
+    def test_highlights_non_empty(self):
+        result = self._call()
+        self.assertIsInstance(result["Highlights"], list)
+        self.assertGreater(len(result["Highlights"]), 0)
+
+    def test_highlights_all_clear_when_healthy(self):
+        result = self._call(
+            uptime={**_TRIAGE_UPTIME, "CpuPercentOverall": 10.0,
+                    "MemoryUsedBytes": 4_000_000_000},
+            disks=[{"DeviceName": "C:", "MountPoint": "C:\\",
+                    "UsedPercent": 50.0, "FreeBytes": 500_000_000}],
+            services=[{"ServiceName": "bits", "DisplayName": "BITS",
+                       "Status": "Running", "StartType": "Automatic"}],
+            events=[],
+        )
+        self.assertEqual(result["Highlights"], ["No significant issues detected."])
+
+    def test_service_exception_degrades_gracefully(self):
+        with patch("umi_mcp.server.get_uptime",  return_value=_TRIAGE_UPTIME), \
+             patch("umi_mcp.server.get_process", return_value=[]), \
+             patch("umi_mcp.server.get_disk",    return_value=[]), \
+             patch("umi_mcp.server.get_service", side_effect=PermissionError("denied")), \
+             patch("umi_mcp.server.get_events",  return_value=[]), \
+             patch("umi_mcp.server.datetime") as mock_dt:
+            mock_dt.now.return_value = _NOW_RC
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.timezone = timezone
+            result = get_umi_triage_bundle()
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["StoppedServices"], [])
+
+    def test_high_cpu_appears_in_highlights(self):
+        result = self._call(
+            uptime={**_TRIAGE_UPTIME, "CpuPercentOverall": 95.0},
+            disks=[], services=[], events=[],
+        )
+        combined = " ".join(result["Highlights"])
+        self.assertIn("CPU", combined)
 
 
 if __name__ == "__main__":

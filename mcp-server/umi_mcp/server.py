@@ -1,3 +1,6 @@
+import platform
+import re
+
 from mcp.server.fastmcp import FastMCP
 from datetime import datetime, timedelta, timezone
 
@@ -15,8 +18,8 @@ _SCHEMA_VERSION = "1"
 
 # Summary-mode field sets for verbosity="summary".
 # These are the minimum fields an agent needs to triage each resource type.
-_PROCESS_SUMMARY_FIELDS = frozenset({"ProcessName", "ProcessId", "CpuPercent", "MemoryBytes", "Status"})
-_SERVICE_SUMMARY_FIELDS = frozenset({"ServiceName", "Status", "StartType"})
+_PROCESS_SUMMARY_FIELDS = frozenset({"ProcessName", "ProcessId", "CpuPercent", "MemoryBytes", "Status", "User"})
+_SERVICE_SUMMARY_FIELDS = frozenset({"ServiceName", "DisplayName", "Status", "StartType"})
 _EVENTS_SUMMARY_FIELDS  = frozenset({"Timestamp", "Level", "Source", "Message"})
 
 _LEVEL_ORDER = {
@@ -87,8 +90,8 @@ def get_umi_process(name: str = None, top: int = None, verbosity: str = "full") 
     Use name to filter by process name substring (e.g. name="python").
     Use top to limit results (e.g. top=10 for the 10 most CPU-intensive processes).
     MemoryBytes is resident set size. CpuPercent may exceed 100 on multi-core systems.
-    verbosity="summary" returns only ProcessName, ProcessId, CpuPercent, MemoryBytes, Status.
-    verbosity="full" (default) returns all fields.
+    verbosity="summary" returns only: ProcessName, ProcessId, CpuPercent, MemoryBytes, Status, User.
+    verbosity="full" (default) returns all fields including CommandLine, ThreadCount, StartTime, etc.
     Response includes SchemaVersion, GeneratedAt, Count, and Items array.
     """
     data = get_process(name=name, top=top)
@@ -124,8 +127,8 @@ def get_umi_service(name: str = None, status: str = None, top: int = None, verbo
     depending on the host OS. Optionally filter by name substring or by status
     (Running, Stopped, Degraded, Starting, Stopping, Paused).
     Use top to limit the number of returned services (useful on Windows with 200+ services).
-    verbosity="summary" returns only ServiceName, Status, StartType.
-    verbosity="full" (default) returns all fields.
+    verbosity="summary" returns only: ServiceName, DisplayName, Status, StartType.
+    verbosity="full" (default) returns all fields including Description, ProcessId, BinaryPath, etc.
     Response includes SchemaVersion, GeneratedAt, Count, and Items array.
     """
     data = get_service(name=name, status=status)
@@ -217,8 +220,8 @@ def get_umi_events(level: str = "Error", source: str = None, last_n: int = 20, v
     source substring, and limit the number of returned entries with last_n.
     Valid level values: Info, Warning, Error, Critical (default: Error).
     Message is truncated to 500 characters.
-    verbosity="summary" returns only Timestamp, Level, Source, Message.
-    verbosity="full" (default) returns all fields including LogName, EventId, User, etc.
+    verbosity="summary" returns only: Timestamp, Level, Source, Message.
+    verbosity="full" (default) returns all fields including LogName, EventId, User, MachineName, etc.
     Response includes SchemaVersion, GeneratedAt, Count, and Items array.
     """
     data = get_events(level=level, source=source, last_n=last_n)
@@ -414,4 +417,252 @@ def get_umi_recent_changes(lookback_hours: int = 4) -> dict:
             "BurstEvents": burst_events,
             "StorageAlerts": storage_alerts,
         },
+    }
+
+
+# --- Windows SCM event patterns for service health correlation ---
+_SCM_CRASH_RE = re.compile(
+    r"The (.+?) service terminated unexpectedly|"
+    r"The (.+?) service has terminated with the following error",
+    re.IGNORECASE,
+)
+_SCM_STATE_RE = re.compile(
+    r"The (.+?) service entered the (\w+) state",
+    re.IGNORECASE,
+)
+_STATUS_PRIORITY = {"Stopped": 0, "Degraded": 1, "Starting": 2, "Stopping": 2, "Paused": 2, "Running": 3, "Unknown": 4}
+
+
+@mcp.tool()
+def get_umi_service_health(
+    lookback_hours: int = 24,
+    only_degraded: bool = False,
+    top: int = 20,
+) -> dict:
+    """
+    Returns service health enriched with crash and restart counts from event logs.
+    On Windows, correlates each service against Service Control Manager events
+    (EventId 7034/7031 = crash, EventId 7036 = state change) within the lookback window.
+    On Linux and macOS, CrashCount and RestartCount are null (not available from journald
+    without per-service queries).
+    Use only_degraded=true to return only services that are Stopped, Degraded, or have crashes.
+    Use top to cap results (default 20, sorted by health status then crash count).
+    Each service record includes: ServiceName, DisplayName, Status, StartType, IsHealthy,
+    CrashCount, RestartCount, LastCrash, LastStateChange.
+    Response includes SchemaVersion, GeneratedAt, LookbackHours, Count, and Services array.
+    """
+    service_data = get_service()
+    is_windows = platform.system() == "Windows"
+
+    # On Windows, pull SCM events and parse crash/restart history.
+    # On other platforms, event correlation is not available.
+    service_events: dict[str, dict] = {}
+    if is_windows:
+        raw_events = get_events(level="Warning", source="Service Control Manager", last_n=500)
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
+
+        for event in raw_events:
+            ts = event.get("Timestamp")
+            if not ts:
+                continue
+            try:
+                if datetime.fromisoformat(ts) < cutoff:
+                    continue
+            except ValueError:
+                continue
+
+            msg = event.get("Message") or ""
+
+            crash_match = _SCM_CRASH_RE.search(msg)
+            if crash_match:
+                svc_name = (crash_match.group(1) or crash_match.group(2) or "").strip().lower()
+                if svc_name:
+                    rec = service_events.setdefault(svc_name, {"crashes": [], "state_changes": []})
+                    rec["crashes"].append({"Timestamp": ts, "Message": event.get("Message")})
+                continue
+
+            state_match = _SCM_STATE_RE.search(msg)
+            if state_match:
+                svc_name = state_match.group(1).strip().lower()
+                state = state_match.group(2).strip()
+                rec = service_events.setdefault(svc_name, {"crashes": [], "state_changes": []})
+                rec["state_changes"].append({"Timestamp": ts, "State": state})
+
+    health_records = []
+    for svc in service_data:
+        svc_name = svc.get("ServiceName") or ""
+        display_name = svc.get("DisplayName") or svc_name
+
+        # Try to match by ServiceName, then DisplayName
+        rec = (
+            service_events.get(svc_name.lower())
+            or service_events.get(display_name.lower())
+            or {"crashes": [], "state_changes": []}
+        )
+
+        crashes = rec["crashes"]
+        state_changes = rec["state_changes"]
+
+        crash_count = len(crashes) if is_windows else None
+        restart_count = (
+            sum(1 for sc in state_changes if sc["State"].lower() == "running")
+            if is_windows else None
+        )
+        last_crash = (
+            max((c["Timestamp"] for c in crashes if c["Timestamp"]), default=None)
+            if crashes else None
+        )
+        last_state_change = (
+            max((sc["Timestamp"] for sc in state_changes if sc["Timestamp"]), default=None)
+            if state_changes else None
+        )
+
+        status = svc.get("Status")
+        is_healthy = status == "Running" and (crash_count or 0) == 0
+
+        health_records.append({
+            "ServiceName": svc_name,
+            "DisplayName": display_name,
+            "Status": status,
+            "StartType": svc.get("StartType"),
+            "IsHealthy": is_healthy,
+            "CrashCount": crash_count,
+            "RestartCount": restart_count,
+            "LastCrash": last_crash,
+            "LastStateChange": last_state_change,
+        })
+
+    if only_degraded:
+        health_records = [
+            r for r in health_records
+            if not r["IsHealthy"] or (r["CrashCount"] or 0) > 0
+        ]
+
+    health_records.sort(key=lambda r: (
+        _STATUS_PRIORITY.get(r["Status"] or "Unknown", 4),
+        -(r["CrashCount"] or 0),
+    ))
+    health_records = health_records[:top]
+
+    return {
+        "SchemaVersion": _SCHEMA_VERSION,
+        "GeneratedAt": datetime.now(tz=timezone.utc).isoformat(),
+        "LookbackHours": lookback_hours,
+        "Count": len(health_records),
+        "Services": health_records,
+    }
+
+
+@mcp.tool()
+def get_umi_triage_bundle() -> dict:
+    """
+    One-call triage entrypoint. Returns everything needed to answer
+    'what is wrong right now?' without chaining multiple tool calls.
+    Combines: system identity, resource utilization, top 10 CPU processes
+    (summary fields), grouped recent errors (last 4h), stopped/degraded
+    automatic services, and storage alerts.
+    Use Highlights for a ready-to-read text summary.
+    This is the recommended first call for agent-driven system diagnosis.
+    Response includes SchemaVersion, GeneratedAt, Hostname, OS, UptimeSeconds,
+    CpuPercent, MemoryUsedPercent, LoadAverage1m, Highlights, TopProcesses,
+    StorageAlerts, StoppedServices, and TopEvents.
+    """
+    uptime_data = get_uptime()
+    process_data = get_process(top=10)
+    disk_data = get_disk()
+    try:
+        service_data = get_service()
+    except Exception:
+        service_data = []
+    events_data = get_events(level="Warning", last_n=200)
+
+    total_memory = uptime_data.get("TotalMemoryBytes")
+    used_memory = uptime_data.get("MemoryUsedBytes")
+    memory_pct = round((used_memory / total_memory) * 100, 1) if total_memory else None
+
+    top_processes = _apply_verbosity(process_data, "summary", _PROCESS_SUMMARY_FIELDS)
+
+    _STORAGE_THRESHOLD = 85.0
+    storage_alerts = [
+        {
+            "DeviceName": d.get("DeviceName"),
+            "MountPoint": d.get("MountPoint"),
+            "UsedPercent": d.get("UsedPercent"),
+            "FreeBytes": d.get("FreeBytes"),
+        }
+        for d in disk_data
+        if (d.get("UsedPercent") or 0) >= _STORAGE_THRESHOLD
+    ]
+
+    stopped_services = [
+        {
+            "ServiceName": s.get("ServiceName"),
+            "DisplayName": s.get("DisplayName"),
+            "Status": s.get("Status"),
+        }
+        for s in service_data
+        if s.get("StartType") == "Automatic" and s.get("Status") in ("Stopped", "Degraded")
+    ]
+
+    # Group events from the last 4 hours
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=4)
+    event_groups: dict = {}
+    for event in events_data:
+        ts = event.get("Timestamp")
+        if not ts:
+            continue
+        try:
+            if datetime.fromisoformat(ts) < cutoff:
+                continue
+        except ValueError:
+            continue
+        key = (event.get("Source"), event.get("EventId"), event.get("Level"))
+        if key not in event_groups:
+            event_groups[key] = {
+                "Source": event.get("Source"),
+                "Level": event.get("Level"),
+                "Count": 0,
+                "SampleMessage": event.get("Message"),
+            }
+        event_groups[key]["Count"] += 1
+
+    top_events = sorted(event_groups.values(), key=lambda g: (
+        _LEVEL_ORDER.get(g.get("Level") or "Unknown", 5),
+        -g["Count"],
+    ))[:10]
+
+    highlights: list[str] = []
+    cpu_pct = uptime_data.get("CpuPercentOverall")
+    if cpu_pct is not None and cpu_pct > 80:
+        highlights.append(f"High system CPU: {cpu_pct}%")
+    if memory_pct is not None and memory_pct > 85:
+        highlights.append(f"High memory usage: {memory_pct}%")
+    for alert in storage_alerts:
+        label = alert["DeviceName"] or alert["MountPoint"] or "unknown"
+        highlights.append(f"Storage {label} at {alert['UsedPercent']}% used")
+    if stopped_services:
+        names = ", ".join(s["ServiceName"] for s in stopped_services[:3])
+        suffix = f" (+{len(stopped_services) - 3} more)" if len(stopped_services) > 3 else ""
+        highlights.append(f"Stopped automatic services: {names}{suffix}")
+    if top_events:
+        e = top_events[0]
+        preview = (e["SampleMessage"] or "")[:80]
+        highlights.append(f"Top event: {e['Source'] or 'unknown'} ({e['Count']}x) — {preview}")
+    if not highlights:
+        highlights.append("No significant issues detected.")
+
+    return {
+        "SchemaVersion": _SCHEMA_VERSION,
+        "GeneratedAt": datetime.now(tz=timezone.utc).isoformat(),
+        "Hostname": uptime_data.get("Hostname"),
+        "OS": uptime_data.get("OS"),
+        "UptimeSeconds": uptime_data.get("UptimeSeconds"),
+        "CpuPercent": uptime_data.get("CpuPercentOverall"),
+        "MemoryUsedPercent": memory_pct,
+        "LoadAverage1m": uptime_data.get("LoadAverage1m"),
+        "Highlights": highlights,
+        "TopProcesses": top_processes,
+        "StorageAlerts": storage_alerts,
+        "StoppedServices": stopped_services,
+        "TopEvents": top_events,
     }
