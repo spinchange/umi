@@ -11,12 +11,12 @@ _GATEWAY_TIMEOUT = 5
 _DNS_TIMEOUT = 5
 
 
-def _load_default_gateway_windows() -> tuple[str | None, str | None]:
-    """Return (gateway_ip, interface_alias) for the lowest-metric default route."""
+def _load_default_gateway_windows() -> "tuple[str | None, str | None, int | None]":
+    """Return (gateway_ip, interface_alias, route_metric) for the lowest-metric default route."""
     ps_cmd = (
         "Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue "
         "| Sort-Object RouteMetric | Select-Object -First 1 "
-        "| Select-Object NextHop, InterfaceAlias | ConvertTo-Json -Compress"
+        "| Select-Object NextHop, InterfaceAlias, RouteMetric | ConvertTo-Json -Compress"
     )
     try:
         out = subprocess.run(
@@ -24,18 +24,19 @@ def _load_default_gateway_windows() -> tuple[str | None, str | None]:
             capture_output=True, text=True, timeout=_GATEWAY_TIMEOUT, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None, None
+        return None, None, None
     if out.returncode != 0 or not out.stdout.strip():
-        return None, None
+        return None, None, None
     try:
         data = json.loads(out.stdout)
     except json.JSONDecodeError:
-        return None, None
+        return None, None, None
     gw = data.get("NextHop")
     iface = data.get("InterfaceAlias")
+    metric = data.get("RouteMetric")
     if gw and gw not in ("", "0.0.0.0", "::"):
-        return gw, iface
-    return None, None
+        return gw, iface, (int(metric) if metric is not None else None)
+    return None, None, None
 
 
 def _load_dns_servers_windows() -> dict[str, list[str]]:
@@ -72,26 +73,34 @@ def _load_dns_servers_windows() -> dict[str, list[str]]:
     return result
 
 
-def _load_default_gateway_linux() -> tuple[str | None, str | None]:
-    """Return (gateway_ip, interface_name) from the default IPv4 route."""
+def _load_default_gateway_linux() -> "tuple[str | None, str | None, int | None]":
+    """Return (gateway_ip, interface_name, route_metric) from the default IPv4 route."""
     try:
         out = subprocess.run(
             ["ip", "route", "show", "default"],
             capture_output=True, text=True, timeout=_GATEWAY_TIMEOUT, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None, None
+        return None, None, None
     for line in out.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 3 and parts[0] == "default" and parts[1] == "via":
             gw = parts[2]
             iface = None
+            metric = None
             if "dev" in parts:
                 idx = parts.index("dev")
                 if idx + 1 < len(parts):
                     iface = parts[idx + 1]
-            return gw, iface
-    return None, None
+            if "metric" in parts:
+                idx = parts.index("metric")
+                if idx + 1 < len(parts):
+                    try:
+                        metric = int(parts[idx + 1])
+                    except ValueError:
+                        pass
+            return gw, iface, metric
+    return None, None, None
 
 
 def _load_dns_servers_resolv() -> list[str]:
@@ -118,15 +127,19 @@ def _load_dns_servers_resolv() -> list[str]:
     return []
 
 
-def _load_default_gateway_macos() -> tuple[str | None, str | None]:
-    """Return (gateway_ip, interface_name) from macOS routing table."""
+def _load_default_gateway_macos() -> "tuple[str | None, str | None, int | None]":
+    """Return (gateway_ip, interface_name, None) from macOS routing table.
+
+    macOS route -n get default does not expose a simple route metric,
+    so RouteMetric is always null on macOS.
+    """
     try:
         out = subprocess.run(
             ["route", "-n", "get", "default"],
             capture_output=True, text=True, timeout=_GATEWAY_TIMEOUT, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None, None
+        return None, None, None
     gw = None
     iface = None
     for line in out.stdout.splitlines():
@@ -135,7 +148,7 @@ def _load_default_gateway_macos() -> tuple[str | None, str | None]:
             gw = line.split(":", 1)[1].strip()
         elif line.startswith("interface:"):
             iface = line.split(":", 1)[1].strip()
-    return gw, iface
+    return gw, iface, None
 
 
 def _load_dns_servers_scutil() -> list[str]:
@@ -157,26 +170,27 @@ def _load_dns_servers_scutil() -> list[str]:
     return unique
 
 
-def _load_network_extras() -> tuple[str | None, str | None, dict[str, list[str]] | list[str]]:
-    """Return (gateway_ip, default_iface, dns_info) for the current OS.
+def _load_network_extras() -> "tuple[str | None, str | None, int | None, dict[str, list[str]] | list[str]]":
+    """Return (gateway_ip, default_iface, route_metric, dns_info) for the current OS.
 
     dns_info is either a dict {iface_alias: [servers]} (Windows) or
     a flat list[str] of system-wide DNS servers (Linux/macOS).
+    route_metric is the metric of the default route (null if unavailable).
     """
     os_name = platform.system()
     if os_name == "Windows":
-        gw, iface = _load_default_gateway_windows()
+        gw, iface, metric = _load_default_gateway_windows()
         dns = _load_dns_servers_windows()
-        return gw, iface, dns
+        return gw, iface, metric, dns
     if os_name == "Linux":
-        gw, iface = _load_default_gateway_linux()
+        gw, iface, metric = _load_default_gateway_linux()
         dns = _load_dns_servers_resolv()
-        return gw, iface, dns
+        return gw, iface, metric, dns
     if os_name == "Darwin":
-        gw, iface = _load_default_gateway_macos()
+        gw, iface, metric = _load_default_gateway_macos()
         dns = _load_dns_servers_scutil()
-        return gw, iface, dns
-    return None, None, []
+        return gw, iface, metric, dns
+    return None, None, None, []
 
 
 def _prefix_to_mask(prefix_len: int) -> str:
@@ -204,7 +218,7 @@ def get_network(include_down: bool = False) -> list[dict]:
     stats = psutil.net_if_stats()
     io_counters = psutil.net_io_counters(pernic=True)
 
-    default_gw, default_iface, dns_info = _load_network_extras()
+    default_gw, default_iface, default_metric, dns_info = _load_network_extras()
     # dns_info is either dict{alias: servers} (Windows) or list[str] (Linux/macOS)
     system_dns: list[str] = dns_info if isinstance(dns_info, list) else []
 
@@ -240,8 +254,11 @@ def get_network(include_down: bool = False) -> list[dict]:
 
         io = io_counters.get(iface_name)
 
-        # Gateway: assign to the default-route interface; null for all others
-        gateway = default_gw if iface_name == default_iface else None
+        is_default_route = (iface_name == default_iface)
+
+        # Gateway and RouteMetric: only for the default-route interface
+        gateway = default_gw if is_default_route else None
+        route_metric = default_metric if is_default_route else None
 
         # DNS: per-interface on Windows; system-wide on Linux/macOS (all Up interfaces)
         if isinstance(dns_info, dict):
@@ -249,14 +266,20 @@ def get_network(include_down: bool = False) -> list[dict]:
         else:
             dns_servers = system_dns if is_up else []
 
+        iface_type = _classify_interface(iface_name)
+        is_vpn = iface_type == "Tunnel"
+
         results.append({
             "InterfaceName": iface_name,
-            "InterfaceType": _classify_interface(iface_name),
+            "InterfaceType": iface_type,
             "Status": "Up" if is_up else "Down",
+            "IsDefaultRoute": is_default_route,
+            "IsVpn": is_vpn,
             "IPv4Address": ipv4,
             "IPv6Address": ipv6,
             "SubnetMask": subnet_mask,
             "DefaultGateway": gateway,
+            "RouteMetric": route_metric,
             "MacAddress": mac,
             "SpeedMbps": stat.speed if stat and stat.speed > 0 else None,
             "DnsServers": dns_servers,

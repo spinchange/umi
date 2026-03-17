@@ -69,6 +69,7 @@ def _get_services_windows(name_filter, status_filter) -> list[dict]:
                 "BinaryPath": svc.get("PathName") or None,
                 "UptimeSeconds": None,
                 "ExitCode": svc.get("ExitCode"),
+                "Publisher": None,  # v1: populated in a future Windows enrichment pass
             })
     except Exception:
         pass
@@ -116,6 +117,7 @@ def _get_services_linux(name_filter, status_filter) -> list[dict]:
                 "BinaryPath": None,
                 "UptimeSeconds": None,
                 "ExitCode": None,
+                "Publisher": None,
             })
     except Exception:
         pass
@@ -157,6 +159,7 @@ def _get_services_macos(name_filter, status_filter) -> list[dict]:
                 "BinaryPath": None,
                 "UptimeSeconds": None,
                 "ExitCode": None,
+                "Publisher": None,
             })
     except Exception:
         pass

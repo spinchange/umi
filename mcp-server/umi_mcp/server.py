@@ -1,5 +1,6 @@
 import platform
 import re
+import time
 
 from mcp.server.fastmcp import FastMCP
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,57 @@ _LEVEL_ORDER = {
     "Unknown": 5,
 }
 
+# --- Issue #13: noise classification ---
+
+# Windows event IDs known to be high-volume operational noise with no action required.
+_KNOWN_NOISE_IDS = frozenset({
+    10016,  # DistributedCOM: DCOM permission error (nearly always benign)
+    4202,   # WLAN AutoConfig: disconnected from network
+    1014,   # DNS Client: name resolution timeout (transient)
+    642,    # Audit policy change (routine)
+    5605,   # Windows backup: shadow copy noise
+})
+# Source name substrings (lowercased) that are structurally noisy on most Windows systems.
+_KNOWN_NOISE_SOURCES = frozenset({"distributedcom", "wlan-autoconfig", "wlan autoconfig"})
+
+
+def _classify_event(
+    source: "str | None",
+    event_id: "int | None",
+    level: "str | None",
+    count: int,
+) -> str:
+    """Return 'noise', 'watch', or 'actionable' for an event group.
+
+    noise      — Known high-volume operational noise; safe to suppress in dashboards.
+    actionable — Critical/Error severity, OR fires ≥10 times in the window.
+    watch      — Everything else (Warning-level, moderate count).
+    """
+    src_lower = (source or "").lower()
+    if event_id in _KNOWN_NOISE_IDS or any(n in src_lower for n in _KNOWN_NOISE_SOURCES):
+        return "noise"
+    level_rank = _LEVEL_ORDER.get(level or "Unknown", 5)
+    if level_rank <= 1 or count >= 10:
+        return "actionable"
+    return "watch"
+
+
+def _is_microsoft_service(svc: dict) -> bool:
+    """Heuristic: True if the service binary lives under a Windows system directory.
+
+    Used to implement the only_non_microsoft filter on get_umi_service.
+    On Linux/macOS this always returns False (all services are non-Microsoft).
+    """
+    path = (svc.get("BinaryPath") or "").lower().replace('"', "").strip()
+    if not path:
+        return False
+    return (
+        "\\windows\\" in path
+        or path.startswith("c:\\windows")
+        or path.startswith("%systemroot%")
+        or "\\microsoft shared\\" in path
+    )
+
 
 def _apply_verbosity(items: list[dict], verbosity: str, summary_fields: frozenset) -> list[dict]:
     """Strip items to summary_fields when verbosity='summary'. No-op for 'full'."""
@@ -39,25 +91,36 @@ def _apply_verbosity(items: list[dict], verbosity: str, summary_fields: frozense
     return items
 
 
-def _wrap(data: "dict | list") -> dict:
+def _wrap(data: "dict | list", collection_time_ms: "float | None" = None) -> dict:
     """Wrap a tool result in the standard UMI response envelope.
 
     Array results become: {SchemaVersion, GeneratedAt, Count, Items: [...]}.
     Dict results get SchemaVersion and GeneratedAt merged at the top level.
+    CollectionTimeMs (ms, 1 decimal) is included when provided.
     """
     now = datetime.now(tz=timezone.utc).isoformat()
     if isinstance(data, list):
-        return {
+        result = {
             "SchemaVersion": _SCHEMA_VERSION,
             "GeneratedAt": now,
             "Count": len(data),
             "Items": data,
         }
-    return {
-        "SchemaVersion": _SCHEMA_VERSION,
-        "GeneratedAt": now,
-        **data,
-    }
+    else:
+        result = {
+            "SchemaVersion": _SCHEMA_VERSION,
+            "GeneratedAt": now,
+            **data,
+        }
+    if collection_time_ms is not None:
+        result["CollectionTimeMs"] = round(collection_time_ms, 1)
+    return result
+
+
+# --- Issue #14: TTL cache for triage_bundle ---
+
+_TRIAGE_CACHE_TTL = 30.0  # seconds
+_triage_cache: dict = {"result": None, "expires_at": 0.0}
 
 
 @mcp.tool()
@@ -67,9 +130,11 @@ def get_umi_disk() -> dict:
     Use this to check which drives exist, their total size, how much is used
     and free, filesystem type, and mount point. Each volume is one object in Items.
     Bytes fields: divide by 1073741824 for GB.
-    Response includes SchemaVersion, GeneratedAt, Count, and Items array.
+    Response includes SchemaVersion, GeneratedAt, CollectionTimeMs, Count, and Items array.
     """
-    return _wrap(get_disk())
+    t0 = time.perf_counter()
+    data = get_disk()
+    return _wrap(data, collection_time_ms=(time.perf_counter() - t0) * 1000)
 
 
 @mcp.tool()
@@ -78,24 +143,41 @@ def get_umi_network(include_down: bool = False) -> dict:
     Returns network interfaces with IP addresses, MAC address, interface type,
     link speed, and status. By default only returns interfaces that are Up.
     Set include_down=true to include inactive interfaces.
-    Response includes SchemaVersion, GeneratedAt, Count, and Items array.
+    Response includes SchemaVersion, GeneratedAt, CollectionTimeMs, Count, and Items array.
     """
-    return _wrap(get_network(include_down=include_down))
+    t0 = time.perf_counter()
+    data = get_network(include_down=include_down)
+    return _wrap(data, collection_time_ms=(time.perf_counter() - t0) * 1000)
 
 
 @mcp.tool()
-def get_umi_process(name: str = None, top: int = None, verbosity: str = "full") -> dict:
+def get_umi_process(
+    name: str = None,
+    top: int = None,
+    verbosity: str = "full",
+    only_user_processes: bool = False,
+) -> dict:
     """
     Returns running processes sorted by CPU usage descending.
     Use name to filter by process name substring (e.g. name="python").
     Use top to limit results (e.g. top=10 for the 10 most CPU-intensive processes).
+    Set only_user_processes=true to exclude System-owned processes (kernel, SYSTEM account, root).
     MemoryBytes is resident set size. CpuPercent may exceed 100 on multi-core systems.
+    Full mode fields include: ProcessName, ProcessId, ParentProcessId, ParentProcessName,
+    CpuPercent, MemoryBytes, MemoryPercent, Status, User, ProcessType, ExecutablePath,
+    Publisher (null in v1), ServiceName (null in v1), StartTime, CommandLine, ThreadCount.
+    ProcessType is a heuristic classification ('System' or 'User'), not an OS-native truth
+    field. It is inferred from PID (<=4 = System) and username (SYSTEM, root, etc.).
     verbosity="summary" returns only: ProcessName, ProcessId, CpuPercent, MemoryBytes, Status, User.
-    verbosity="full" (default) returns all fields including CommandLine, ThreadCount, StartTime, etc.
-    Response includes SchemaVersion, GeneratedAt, Count, and Items array.
+    verbosity="full" (default) returns all fields.
+    Response includes SchemaVersion, GeneratedAt, CollectionTimeMs, Count, and Items array.
     """
+    t0 = time.perf_counter()
     data = get_process(name=name, top=top)
-    return _wrap(_apply_verbosity(data, verbosity, _PROCESS_SUMMARY_FIELDS))
+    elapsed = (time.perf_counter() - t0) * 1000
+    if only_user_processes:
+        data = [p for p in data if p.get("ProcessType") == "User"]
+    return _wrap(_apply_verbosity(data, verbosity, _PROCESS_SUMMARY_FIELDS), collection_time_ms=elapsed)
 
 
 @mcp.tool()
@@ -104,9 +186,14 @@ def get_umi_uptime() -> dict:
     Returns system identity and uptime: hostname, OS family (Windows/Linux/macOS),
     OS version string, CPU architecture, boot timestamp, seconds since boot,
     human-readable uptime, logical CPU count, and total installed RAM in bytes.
-    Response includes SchemaVersion and GeneratedAt alongside all uptime fields.
+    Response includes SchemaVersion, GeneratedAt, CollectionTimeMs alongside all uptime fields.
     """
-    return _wrap(get_uptime())
+    t0 = time.perf_counter()
+    data = get_uptime()
+    elapsed = (time.perf_counter() - t0) * 1000
+    result = _wrap(data)
+    result["CollectionTimeMs"] = round(elapsed, 1)
+    return result
 
 
 @mcp.tool()
@@ -115,26 +202,44 @@ def get_umi_user(current_only: bool = False) -> dict:
     Returns local user accounts with username, user ID, home directory, shell,
     group memberships, and admin status. Set current_only=true to return only
     the user running the current session.
-    Response includes SchemaVersion, GeneratedAt, Count, and Items array.
+    Response includes SchemaVersion, GeneratedAt, CollectionTimeMs, Count, and Items array.
     """
-    return _wrap(get_user(current_only=current_only))
+    t0 = time.perf_counter()
+    data = get_user(current_only=current_only)
+    return _wrap(data, collection_time_ms=(time.perf_counter() - t0) * 1000)
 
 
 @mcp.tool()
-def get_umi_service(name: str = None, status: str = None, top: int = None, verbosity: str = "full") -> dict:
+def get_umi_service(
+    name: str = None,
+    status: str = None,
+    top: int = None,
+    verbosity: str = "summary",
+    only_non_microsoft: bool = False,
+) -> dict:
     """
     Returns system services: Windows Services, systemd units, or launchd agents
     depending on the host OS. Optionally filter by name substring or by status
     (Running, Stopped, Degraded, Starting, Stopping, Paused).
-    Use top to limit the number of returned services (useful on Windows with 200+ services).
-    verbosity="summary" returns only: ServiceName, DisplayName, Status, StartType.
-    verbosity="full" (default) returns all fields including Description, ProcessId, BinaryPath, etc.
-    Response includes SchemaVersion, GeneratedAt, Count, and Items array.
+    Set only_non_microsoft=true to exclude services whose BinaryPath is under
+    Windows system directories (C:/Windows/, %SystemRoot%). This filter is
+    Windows-meaningful only — on Linux and macOS all services pass through unchanged.
+    On Windows the unfiltered list can exceed 200 entries; use top or
+    only_non_microsoft to keep the response token-efficient.
+    Use top to limit the number of returned services.
+    verbosity="summary" (default) returns only: ServiceName, DisplayName, Status, StartType.
+    verbosity="full" returns all fields: Description, User, ProcessId, BinaryPath,
+    UptimeSeconds, ExitCode, Publisher (null in v1).
+    Response includes SchemaVersion, GeneratedAt, CollectionTimeMs, Count, and Items array.
     """
+    t0 = time.perf_counter()
     data = get_service(name=name, status=status)
+    if only_non_microsoft:
+        data = [s for s in data if not _is_microsoft_service(s)]
     if top is not None:
         data = data[:top]
-    return _wrap(_apply_verbosity(data, verbosity, _SERVICE_SUMMARY_FIELDS))
+    elapsed = (time.perf_counter() - t0) * 1000
+    return _wrap(_apply_verbosity(data, verbosity, _SERVICE_SUMMARY_FIELDS), collection_time_ms=elapsed)
 
 
 @mcp.tool()
@@ -146,11 +251,25 @@ def get_umi_summary(error_lookback_hours: int = 24) -> dict:
     situational awareness and initial triage before employing specialized
     diagnostic tools. Valid events_level values for error counting:
     Info, Warning, Error, Critical.
+    Response includes Timing with per-collector and TotalMs breakdowns.
     """
+    t_total = time.perf_counter()
+
+    t0 = time.perf_counter()
     uptime_data = get_uptime()
+    uptime_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     disk_data = get_disk()
+    disk_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     process_data = get_process()
+    process_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     events_data = get_events(level="Error", last_n=500)
+    events_ms = (time.perf_counter() - t0) * 1000
 
     total_memory_bytes = uptime_data.get("TotalMemoryBytes")
     memory_used_bytes = uptime_data.get("MemoryUsedBytes")
@@ -184,6 +303,8 @@ def get_umi_summary(error_lookback_hours: int = 24) -> dict:
 
     last_event = events_data[0] if events_data else None
 
+    total_ms = (time.perf_counter() - t_total) * 1000
+
     return {
         "SchemaVersion": _SCHEMA_VERSION,
         "GeneratedAt": datetime.now(tz=timezone.utc).isoformat(),
@@ -209,6 +330,13 @@ def get_umi_summary(error_lookback_hours: int = 24) -> dict:
         "LastEventTimestamp": last_event.get("Timestamp") if last_event else None,
         "LastEventLevel": last_event.get("Level") if last_event else None,
         "LastEventMessage": last_event.get("Message") if last_event else None,
+        "Timing": {
+            "UptimeMs": round(uptime_ms, 1),
+            "DiskMs": round(disk_ms, 1),
+            "ProcessMs": round(process_ms, 1),
+            "EventsMs": round(events_ms, 1),
+            "TotalMs": round(total_ms, 1),
+        },
     }
 
 
@@ -222,10 +350,12 @@ def get_umi_events(level: str = "Error", source: str = None, last_n: int = 20, v
     Message is truncated to 500 characters.
     verbosity="summary" returns only: Timestamp, Level, Source, Message.
     verbosity="full" (default) returns all fields including LogName, EventId, User, MachineName, etc.
-    Response includes SchemaVersion, GeneratedAt, Count, and Items array.
+    Response includes SchemaVersion, GeneratedAt, CollectionTimeMs, Count, and Items array.
     """
+    t0 = time.perf_counter()
     data = get_events(level=level, source=source, last_n=last_n)
-    return _wrap(_apply_verbosity(data, verbosity, _EVENTS_SUMMARY_FIELDS))
+    elapsed = (time.perf_counter() - t0) * 1000
+    return _wrap(_apply_verbosity(data, verbosity, _EVENTS_SUMMARY_FIELDS), collection_time_ms=elapsed)
 
 
 @mcp.tool()
@@ -241,11 +371,16 @@ def get_umi_event_summary(
     Use level to set minimum severity (default: Warning).
     Use top to cap the number of groups returned (default: 20).
     Groups are sorted by Count descending, then by severity.
-    Each group includes FirstSeen, LastSeen, and a SampleMessage.
-    Response includes SchemaVersion, GeneratedAt, LookbackHours, Count, and Groups array.
+    Each group includes FirstSeen, LastSeen, SampleMessage, and Classification
+    ('noise' / 'watch' / 'actionable').
+    Response includes SchemaVersion, GeneratedAt, LookbackHours, Count, Groups, and Timing.
     """
+    t_total = time.perf_counter()
+
     cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
+    t0 = time.perf_counter()
     raw = get_events(level=level, last_n=500)
+    events_ms = (time.perf_counter() - t0) * 1000
 
     in_window = []
     for event in raw:
@@ -279,10 +414,16 @@ def get_umi_event_summary(
             if g["LastSeen"] is None or ts > g["LastSeen"]:
                 g["LastSeen"] = ts
 
+    # Attach noise classification to each group
+    for g in groups.values():
+        g["Classification"] = _classify_event(g["Source"], g["EventId"], g["Level"], g["Count"])
+
     sorted_groups = sorted(
         groups.values(),
         key=lambda g: (-g["Count"], _LEVEL_ORDER.get(g.get("Level") or "Unknown", 5)),
     )[:top]
+
+    total_ms = (time.perf_counter() - t_total) * 1000
 
     return {
         "SchemaVersion": _SCHEMA_VERSION,
@@ -291,6 +432,10 @@ def get_umi_event_summary(
         "Level": level,
         "Count": len(sorted_groups),
         "Groups": list(sorted_groups),
+        "Timing": {
+            "EventsMs": round(events_ms, 1),
+            "TotalMs": round(total_ms, 1),
+        },
     }
 
 
@@ -306,16 +451,33 @@ def get_umi_recent_changes(lookback_hours: int = 4) -> dict:
     Changes.ServiceCrashes: Automatic-start services currently Stopped or Degraded.
     Changes.BurstEvents: event sources that fired 3+ times in the lookback window.
     Changes.StorageAlerts: volumes at or above 85% used.
-    Response includes SchemaVersion, GeneratedAt, LookbackHours, Hostname, Highlights, and Changes.
+    Response includes SchemaVersion, GeneratedAt, LookbackHours, Hostname, Highlights,
+    Changes, and Timing with per-collector and TotalMs breakdowns.
     """
+    t_total = time.perf_counter()
+
+    t0 = time.perf_counter()
     uptime_data = get_uptime()
+    uptime_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     process_data = get_process()
+    process_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     disk_data = get_disk()
+    disk_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     try:
         service_data = get_service()
     except Exception:
         service_data = []
+    service_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     raw_events = get_events(level="Warning", last_n=500)
+    events_ms = (time.perf_counter() - t0) * 1000
 
     cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
 
@@ -405,6 +567,8 @@ def get_umi_recent_changes(lookback_hours: int = 4) -> dict:
     if not highlights:
         highlights.append("No significant changes detected.")
 
+    total_ms = (time.perf_counter() - t_total) * 1000
+
     return {
         "SchemaVersion": _SCHEMA_VERSION,
         "GeneratedAt": datetime.now(tz=timezone.utc).isoformat(),
@@ -416,6 +580,14 @@ def get_umi_recent_changes(lookback_hours: int = 4) -> dict:
             "ServiceCrashes": service_crashes,
             "BurstEvents": burst_events,
             "StorageAlerts": storage_alerts,
+        },
+        "Timing": {
+            "UptimeMs": round(uptime_ms, 1),
+            "ProcessMs": round(process_ms, 1),
+            "DiskMs": round(disk_ms, 1),
+            "ServiceMs": round(service_ms, 1),
+            "EventsMs": round(events_ms, 1),
+            "TotalMs": round(total_ms, 1),
         },
     }
 
@@ -449,16 +621,25 @@ def get_umi_service_health(
     Use top to cap results (default 20, sorted by health status then crash count).
     Each service record includes: ServiceName, DisplayName, Status, StartType, IsHealthy,
     CrashCount, RestartCount, LastCrash, LastStateChange.
-    Response includes SchemaVersion, GeneratedAt, LookbackHours, Count, and Services array.
+    Response includes SchemaVersion, GeneratedAt, LookbackHours, Count, Services, and Timing.
     """
+    t_total = time.perf_counter()
+
+    t0 = time.perf_counter()
     service_data = get_service()
+    service_ms = (time.perf_counter() - t0) * 1000
+
     is_windows = platform.system() == "Windows"
 
     # On Windows, pull SCM events and parse crash/restart history.
     # On other platforms, event correlation is not available.
     service_events: dict[str, dict] = {}
+    events_ms = 0.0
     if is_windows:
+        t0 = time.perf_counter()
         raw_events = get_events(level="Warning", source="Service Control Manager", last_n=500)
+        events_ms = (time.perf_counter() - t0) * 1000
+
         cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
 
         for event in raw_events:
@@ -544,12 +725,19 @@ def get_umi_service_health(
     ))
     health_records = health_records[:top]
 
+    total_ms = (time.perf_counter() - t_total) * 1000
+
     return {
         "SchemaVersion": _SCHEMA_VERSION,
         "GeneratedAt": datetime.now(tz=timezone.utc).isoformat(),
         "LookbackHours": lookback_hours,
         "Count": len(health_records),
         "Services": health_records,
+        "Timing": {
+            "ServiceMs": round(service_ms, 1),
+            "EventsMs": round(events_ms, 1),
+            "TotalMs": round(total_ms, 1),
+        },
     }
 
 
@@ -562,19 +750,41 @@ def get_umi_triage_bundle() -> dict:
     (summary fields), grouped recent errors (last 4h), stopped/degraded
     automatic services, and storage alerts.
     Use Highlights for a ready-to-read text summary.
+    TopEvents include Classification ('noise'/'watch'/'actionable') for filtering.
+    Results are cached for 30 seconds — check GeneratedAt for data freshness.
     This is the recommended first call for agent-driven system diagnosis.
     Response includes SchemaVersion, GeneratedAt, Hostname, OS, UptimeSeconds,
     CpuPercent, MemoryUsedPercent, LoadAverage1m, Highlights, TopProcesses,
-    StorageAlerts, StoppedServices, and TopEvents.
+    StorageAlerts, StoppedServices, TopEvents, and Timing.
     """
+    now_ts = time.monotonic()
+    if _triage_cache["result"] is not None and now_ts < _triage_cache["expires_at"]:
+        return _triage_cache["result"]
+
+    t_total = time.perf_counter()
+
+    t0 = time.perf_counter()
     uptime_data = get_uptime()
+    uptime_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     process_data = get_process(top=10)
+    process_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     disk_data = get_disk()
+    disk_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     try:
         service_data = get_service()
     except Exception:
         service_data = []
+    service_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
     events_data = get_events(level="Warning", last_n=200)
+    events_ms = (time.perf_counter() - t0) * 1000
 
     total_memory = uptime_data.get("TotalMemoryBytes")
     used_memory = uptime_data.get("MemoryUsedBytes")
@@ -602,7 +812,7 @@ def get_umi_triage_bundle() -> dict:
         }
         for s in service_data
         if s.get("StartType") == "Automatic" and s.get("Status") in ("Stopped", "Degraded")
-    ]
+    ][:10]  # Cap at 10 to keep triage bundle token-efficient
 
     # Group events from the last 4 hours
     cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=4)
@@ -625,6 +835,11 @@ def get_umi_triage_bundle() -> dict:
                 "SampleMessage": event.get("Message"),
             }
         event_groups[key]["Count"] += 1
+
+    # Attach classification before sorting
+    for key, g in event_groups.items():
+        event_id = key[1]  # EventId from the grouping key
+        g["Classification"] = _classify_event(g["Source"], event_id, g["Level"], g["Count"])
 
     top_events = sorted(event_groups.values(), key=lambda g: (
         _LEVEL_ORDER.get(g.get("Level") or "Unknown", 5),
@@ -651,7 +866,9 @@ def get_umi_triage_bundle() -> dict:
     if not highlights:
         highlights.append("No significant issues detected.")
 
-    return {
+    total_ms = (time.perf_counter() - t_total) * 1000
+
+    result = {
         "SchemaVersion": _SCHEMA_VERSION,
         "GeneratedAt": datetime.now(tz=timezone.utc).isoformat(),
         "Hostname": uptime_data.get("Hostname"),
@@ -665,4 +882,97 @@ def get_umi_triage_bundle() -> dict:
         "StorageAlerts": storage_alerts,
         "StoppedServices": stopped_services,
         "TopEvents": top_events,
+        "Timing": {
+            "UptimeMs": round(uptime_ms, 1),
+            "ProcessMs": round(process_ms, 1),
+            "DiskMs": round(disk_ms, 1),
+            "ServiceMs": round(service_ms, 1),
+            "EventsMs": round(events_ms, 1),
+            "TotalMs": round(total_ms, 1),
+        },
     }
+
+    _triage_cache["result"] = result
+    _triage_cache["expires_at"] = time.monotonic() + _TRIAGE_CACHE_TTL
+    return result
+
+
+# --- Issue #7: Process trends ---
+
+_TRENDS_SORT_KEYS = {
+    "cpu_avg": lambda t: -t["CpuAvgPercent"],
+    "cpu_max": lambda t: -t["CpuMaxPercent"],
+    "mem_avg": lambda t: -t["MemoryAvgBytes"],
+    "mem_max": lambda t: -t["MemoryMaxBytes"],
+}
+_TRENDS_SLEEP = 1.5  # seconds between samples
+_TRENDS_CPU_DELTA_THRESHOLD = 5.0    # % change to count as Increasing/Decreasing
+_TRENDS_MEM_DELTA_THRESHOLD = 50_000_000  # 50 MB change to count as Increasing
+
+
+@mcp.tool()
+def get_umi_process_trends(top: int = 10, sort: str = "cpu_avg") -> dict:
+    """
+    Returns CPU and memory trends for processes by sampling twice with a ~1.5s gap.
+    Processes that appear in both samples are matched by ProcessId and compared.
+    Fields per process: ProcessName, ProcessId, CpuAvgPercent, CpuMaxPercent,
+    CpuDeltaPercent, MemoryAvgBytes, MemoryMaxBytes, MemoryDeltaBytes, Trend.
+    Trend: 'Increasing' (CPU delta >5% or memory delta >50MB), 'Decreasing'
+    (CPU delta < -5%), or 'Stable'.
+    sort: 'cpu_avg' (default), 'cpu_max', 'mem_avg', 'mem_max'.
+    top: cap returned results (default 10).
+    Note: this call takes ~2.5s minimum due to two CPU sampling passes.
+    Response includes SchemaVersion, GeneratedAt, CollectionTimeMs, Count, and Items array.
+    """
+    t_total = time.perf_counter()
+
+    snap1 = get_process()
+    time.sleep(_TRENDS_SLEEP)
+    snap2 = get_process()
+
+    by_pid: dict[int, dict] = {
+        p["ProcessId"]: p
+        for p in snap1
+        if p.get("ProcessId") is not None
+    }
+
+    trends = []
+    for p2 in snap2:
+        pid = p2.get("ProcessId")
+        p1 = by_pid.get(pid)
+        if p1 is None:
+            continue  # process appeared between samples — skip
+
+        cpu1 = p1.get("CpuPercent") or 0.0
+        cpu2 = p2.get("CpuPercent") or 0.0
+        mem1 = p1.get("MemoryBytes") or 0
+        mem2 = p2.get("MemoryBytes") or 0
+
+        cpu_delta = round(cpu2 - cpu1, 2)
+        mem_delta = mem2 - mem1
+
+        if cpu_delta > _TRENDS_CPU_DELTA_THRESHOLD or mem_delta > _TRENDS_MEM_DELTA_THRESHOLD:
+            trend = "Increasing"
+        elif cpu_delta < -_TRENDS_CPU_DELTA_THRESHOLD:
+            trend = "Decreasing"
+        else:
+            trend = "Stable"
+
+        trends.append({
+            "ProcessName": p2.get("ProcessName"),
+            "ProcessId": pid,
+            "CpuAvgPercent": round((cpu1 + cpu2) / 2, 2),
+            "CpuMaxPercent": round(max(cpu1, cpu2), 2),
+            "CpuDeltaPercent": cpu_delta,
+            "MemoryAvgBytes": (mem1 + mem2) // 2,
+            "MemoryMaxBytes": max(mem1, mem2),
+            "MemoryDeltaBytes": mem_delta,
+            "Trend": trend,
+        })
+
+    key_fn = _TRENDS_SORT_KEYS.get(sort, _TRENDS_SORT_KEYS["cpu_avg"])
+    trends.sort(key=key_fn)
+    trends = trends[:top]
+
+    elapsed = (time.perf_counter() - t_total) * 1000
+    return _wrap(trends, collection_time_ms=elapsed)

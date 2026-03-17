@@ -8,8 +8,33 @@ Every UMI endpoint returns a JSON **object**, never a bare array. All responses 
 |-------|------|------------|
 | `SchemaVersion` | string | All endpoints |
 | `GeneratedAt` | ISO 8601 string | All endpoints |
+| `CollectionTimeMs` | float (ms, 1 decimal) | Simple endpoints |
 | `Count` | integer | Array endpoints |
 | `Items` | array | Array endpoints |
+| `Timing` | object | Aggregate endpoints |
+
+### `CollectionTimeMs` vs `Timing`
+
+**Simple endpoints** (`get_umi_disk`, `get_umi_network`, `get_umi_process`, `get_umi_uptime`, `get_umi_user`, `get_umi_service`, `get_umi_events`, `get_umi_process_trends`) include a single `CollectionTimeMs` field at the envelope level. This measures only the time spent inside the underlying data collector (e.g. the psutil call, or the PowerShell subprocess). It does not include serialisation or MCP framing overhead.
+
+**Aggregate endpoints** (`get_umi_summary`, `get_umi_event_summary`, `get_umi_recent_changes`, `get_umi_service_health`, `get_umi_triage_bundle`) call multiple collectors. They expose a `Timing` object with per-collector breakdowns and a `TotalMs` field:
+
+```json
+{
+  "Timing": {
+    "UptimeMs": 12.3,
+    "ProcessMs": 620.1,
+    "DiskMs": 8.4,
+    "ServiceMs": 45.2,
+    "EventsMs": 180.0,
+    "TotalMs": 866.0
+  }
+}
+```
+
+`TotalMs` includes all collector time plus in-process aggregation. The sum of per-collector fields may be slightly less than `TotalMs` due to Python-side grouping work between calls.
+
+Not all per-collector keys appear in every aggregate endpoint — only the collectors that endpoint actually calls are included.
 
 ## Response Shapes
 
@@ -68,11 +93,15 @@ These have their own documented shapes. See each endpoint's docstring or the sec
       "Count": 8,
       "FirstSeen": "2026-03-16T08:00:00+00:00",
       "LastSeen":  "2026-03-16T11:45:00+00:00",
-      "SampleMessage": "The Print Spooler service terminated unexpectedly."
+      "SampleMessage": "The Print Spooler service terminated unexpectedly.",
+      "Classification": "actionable"
     }
-  ]
+  ],
+  "Timing": { "EventsMs": 180.0, "TotalMs": 182.1 }
 }
 ```
+
+`Classification` values: `"noise"` (safe to suppress), `"watch"` (worth noting), `"actionable"` (requires attention). Classification is assigned per group based on known noisy event IDs/sources and severity heuristics — see `_classify_event()` in `server.py` for the full rule set.
 
 **`get_umi_recent_changes`:**
 ```json
@@ -90,7 +119,8 @@ These have their own documented shapes. See each endpoint's docstring or the sec
     "ServiceCrashes": [ { "ServiceName": "spooler", "DisplayName": "Print Spooler", "Status": "Stopped" } ],
     "BurstEvents":    [ { "Source": "Disk", "EventId": 51, "Level": "Error", "Count": 12, "SampleMessage": "..." } ],
     "StorageAlerts":  [ { "DeviceName": "C:", "MountPoint": "C:\\", "UsedPercent": 91.0, "FreeBytes": 9000000 } ]
-  }
+  },
+  "Timing": { "UptimeMs": 12.1, "ProcessMs": 620.0, "DiskMs": 8.2, "ServiceMs": 45.0, "EventsMs": 180.0, "TotalMs": 866.0 }
 }
 ```
 
@@ -135,6 +165,43 @@ for item in items:
 
 `Count` equals `len(result["Items"])` and is provided for cheap size checks without iterating `Items`.
 
+## Field Semantics Notes
+
+### Level normalization (events endpoints)
+
+The `Level` field is normalized across all platforms to one of five canonical values:
+`Critical`, `Error`, `Warning`, `Information`, `Verbose`. Platform sources:
+
+| Platform | Raw value → Level |
+|----------|-------------------|
+| Windows | EventLog level int: 1→Critical, 2→Error, 3→Warning, 4→Information, 5→Verbose |
+| Linux | journald PRIORITY: 0-2→Critical, 3→Error, 4→Warning, 5-6→Information, 7→Verbose |
+| macOS | messageType: fault→Critical, error→Error, default→Warning |
+
+An unmapped raw value becomes `Unknown`. The string `"Info"` is accepted as an alias for `"Information"` when passed as a filter parameter.
+
+### CpuPercent (process endpoints)
+
+`CpuPercent` is a delta measurement sampled over a ~0.5s interval per process. On multi-core systems it can exceed 100 (e.g. 800% on an 8-core machine at full single-thread utilisation is normal). It is not a point-in-time reading and will be 0.0 for processes that started during the sampling window.
+
+`get_umi_process_trends` uses two such samples separated by ~1.5s and reports the delta between them. This is a short-window trend, not long-horizon history.
+
+### IsRemovable (disk endpoint)
+
+`IsRemovable` is a heuristic:
+- All platforms: `True` if the filesystem type is `iso9660`, `udf`, or `cdfs`, or if mount options include `cdrom` or `removable`
+- Linux only: authoritative sysfs read from `/sys/class/block/<dev>/removable` (value `1` = removable) as a secondary check
+
+On Windows, psutil does not expose a reliable removable flag; the heuristic relies solely on filesystem type and mount options. USB drives formatted as NTFS may not be detected as removable.
+
+### Service endpoint scale (Windows)
+
+`get_umi_service()` defaults to `verbosity="summary"` (4 fields: ServiceName, DisplayName, Status, StartType). On Windows this still returns 200+ items. For further reduction:
+- Use `only_non_microsoft=True` to drop OS-owned services (typically ~70% of Windows services)
+- Use `top=N` to hard-cap the result set
+- Use `get_umi_triage_bundle()` or `get_umi_service_health()` for pre-filtered views
+- Use `verbosity="full"` only for explicit drill-down on a specific service
+
 ## Platform Notes
 
 ### DNS servers (network endpoint)
@@ -143,9 +210,33 @@ for item in items:
 
 On Linux systems running **systemd-resolved** (common on Ubuntu, Debian, Fedora), `/etc/resolv.conf` typically points to a local stub (`127.0.0.53`). UMI automatically reads from `/run/systemd/resolve/resolv.conf` first to surface the real upstream resolvers. If only stub addresses are found they are returned as-is.
 
-### Default gateway (network endpoint)
+### Default gateway and route metadata (network endpoint)
 
 `DefaultGateway` is assigned to the interface identified as the system's lowest-metric default route. All other interfaces get `null`. When a VPN is active it may become the default route interface; the physical interface's `DefaultGateway` will then be `null` until the VPN disconnects.
+
+`IsDefaultRoute` is `true` for the same interface that holds `DefaultGateway`, and `false` for all others. It is provided as a boolean convenience to avoid a null-check on `DefaultGateway`.
+
+`RouteMetric` reflects the route metric of the default route and is populated only on the default-route interface (all others get `null`). Platform availability:
+
+| Platform | Source | Notes |
+|----------|--------|-------|
+| Windows | `Get-NetRoute RouteMetric` | Reliable; typically 25–50 for physical, higher for virtual |
+| Linux | `ip route show default metric` field | Available when `metric` appears in the route line |
+| macOS | Not available | Always `null` — `route -n get default` does not expose a numeric metric |
+
+`IsVpn` is `true` when `InterfaceType == "Tunnel"` (interface name starts with `tun`, `tap`, or `vpn`). This is a name-based heuristic; some VPN clients use non-standard names and will not be detected.
+
+## Process Trends (short-window sampled)
+
+`get_umi_process_trends` performs two CPU/memory snapshots ~1.5 s apart and reports delta fields (`CpuDeltaPercent`, `MemoryDeltaBytes`) and a `Trend` label (`Increasing` / `Decreasing` / `Stable`).
+
+**This is a short-window point-in-time sample, not long-horizon historical trending.** A single call reflects what changed in the last ~1.5 seconds. Use it to catch runaway processes or memory leaks in progress, not to reason about hour-long growth patterns. The endpoint takes approximately 2.5 s to complete (two CPU sampling passes of 0.5 s each, plus 1.5 s inter-sample sleep).
+
+Trend thresholds: CPU delta > 5% OR memory delta > 50 MB → `Increasing`; CPU delta < −5% → `Decreasing`; otherwise `Stable`.
+
+## `get_umi_triage_bundle` cache semantics
+
+Results are cached for **30 seconds**. Check `GeneratedAt` to determine data freshness. Agents that need the most current snapshot can call individual endpoints instead.
 
 ## SchemaVersion
 

@@ -18,10 +18,30 @@ STATUS_MAP = {
 ATTRS = [
     "pid", "name", "ppid", "memory_info",
     "memory_percent", "status", "username", "create_time",
-    "cmdline", "num_threads",
+    "cmdline", "num_threads", "exe",
 ]
 
 CPU_SAMPLE_INTERVAL = 0.5
+
+# Usernames that indicate a kernel or OS-owned process on Windows and Unix.
+_SYSTEM_USERNAMES = frozenset({
+    "system",
+    "nt authority\\system",
+    "nt authority\\network service",
+    "nt authority\\local service",
+    "local service",
+    "network service",
+    "root",
+})
+
+
+def _classify_process_type(username: "str | None", pid: int) -> str:
+    """Return 'System' for kernel/OS-owned processes; 'User' for everything else."""
+    if pid <= 4:
+        return "System"
+    if (username or "").lower() in _SYSTEM_USERNAMES:
+        return "System"
+    return "User"
 
 
 def get_process(name: str = None, top: int = None) -> list[dict]:
@@ -43,6 +63,13 @@ def get_process(name: str = None, top: int = None) -> list[dict]:
             continue
         procs.append((proc, info))
 
+    # Build PID→name map from the full collected list for ParentProcessName lookup
+    pid_to_name: dict[int, str] = {
+        info["pid"]: info["name"]
+        for _, info in procs
+        if info.get("pid") is not None and info.get("name")
+    }
+
     # Wait for the measurement interval
     time.sleep(CPU_SAMPLE_INTERVAL)
 
@@ -53,6 +80,12 @@ def get_process(name: str = None, top: int = None) -> list[dict]:
             cpu = proc.cpu_percent()  # Accurate delta since pass 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             cpu = 0.0
+
+        # ExecutablePath — may raise AccessDenied on system processes
+        try:
+            exe_path = info.get("exe") or None
+        except Exception:
+            exe_path = None
 
         mem_bytes = info["memory_info"].rss if info["memory_info"] else 0
 
@@ -67,16 +100,24 @@ def get_process(name: str = None, top: int = None) -> list[dict]:
 
         cmdline = " ".join(info["cmdline"]) if info["cmdline"] else None
         status = STATUS_MAP.get(info.get("status", ""), "Unknown")
+        username = info["username"]
+        pid = info["pid"]
+        ppid = info.get("ppid")
 
         results.append({
             "ProcessName": info["name"],
-            "ProcessId": info["pid"],
-            "ParentProcessId": info["ppid"],
+            "ProcessId": pid,
+            "ParentProcessId": ppid,
+            "ParentProcessName": pid_to_name.get(ppid) if ppid is not None else None,
             "CpuPercent": round(cpu, 1),
             "MemoryBytes": mem_bytes,
             "MemoryPercent": round(info["memory_percent"], 1) if info["memory_percent"] else None,
             "Status": status,
-            "User": info["username"],
+            "User": username,
+            "ProcessType": _classify_process_type(username, pid),
+            "ExecutablePath": exe_path,
+            "Publisher": None,   # v1: populated in a future Windows enrichment pass
+            "ServiceName": None, # v1: populated in a future Windows enrichment pass
             "StartTime": start_time,
             "CommandLine": cmdline,
             "ThreadCount": info["num_threads"],

@@ -22,6 +22,7 @@ from umi_mcp.server import (
     get_umi_recent_changes,
     get_umi_service_health,
     get_umi_triage_bundle,
+    get_umi_process_trends,
 )
 from umi_mcp.tools import disk, uptime, network, process, service, user, events
 
@@ -87,8 +88,12 @@ class UptimeToolTests(unittest.TestCase):
     @patch("umi_mcp.tools.uptime.datetime")
     @patch("umi_mcp.tools.uptime.psutil.virtual_memory")
     @patch("umi_mcp.tools.uptime.psutil.swap_memory")
+    @patch("umi_mcp.tools.uptime.platform.machine", return_value="x86_64")
+    @patch("umi_mcp.tools.uptime.psutil.cpu_percent", return_value=10.5)
     def test_uptime_macos_with_load(
         self,
+        _cpu_pct,
+        _machine,
         mock_swap,
         mock_virt,
         mock_datetime,
@@ -891,6 +896,7 @@ class ServiceToolExtendedCoverageTests(unittest.TestCase):
                 "BinaryPath": None,
                 "UptimeSeconds": None,
                 "ExitCode": None,
+                "Publisher": None,
             }
         ])
         self.assertEqual(stopped, [
@@ -905,6 +911,7 @@ class ServiceToolExtendedCoverageTests(unittest.TestCase):
                 "BinaryPath": None,
                 "UptimeSeconds": None,
                 "ExitCode": None,
+                "Publisher": None,
             }
         ])
 
@@ -1584,7 +1591,7 @@ class GoldenShapeTests(unittest.TestCase):
         mock_dt.fromisoformat = datetime.fromisoformat
         mock_dt.timezone = timezone
         result = get_umi_event_summary()
-        expected = {"SchemaVersion", "GeneratedAt", "LookbackHours", "Level", "Count", "Groups"}
+        expected = {"SchemaVersion", "GeneratedAt", "LookbackHours", "Level", "Count", "Groups", "Timing"}
         self.assertEqual(set(result.keys()), expected)
         self.assertIsInstance(result["Groups"], list)
 
@@ -1600,7 +1607,7 @@ class GoldenShapeTests(unittest.TestCase):
         result = get_umi_event_summary()
         self.assertEqual(result["Count"], 1)
         group = result["Groups"][0]
-        expected_group_keys = {"Source", "EventId", "Level", "Count", "FirstSeen", "LastSeen", "SampleMessage"}
+        expected_group_keys = {"Source", "EventId", "Level", "Count", "FirstSeen", "LastSeen", "SampleMessage", "Classification"}
         self.assertEqual(set(group.keys()), expected_group_keys)
 
     # --- recent_changes shape ---
@@ -1616,7 +1623,7 @@ class GoldenShapeTests(unittest.TestCase):
         mock_dt.fromisoformat = datetime.fromisoformat
         mock_dt.timezone = timezone
         result = get_umi_recent_changes()
-        expected = {"SchemaVersion", "GeneratedAt", "LookbackHours", "Hostname", "Highlights", "Changes"}
+        expected = {"SchemaVersion", "GeneratedAt", "LookbackHours", "Hostname", "Highlights", "Changes", "Timing"}
         self.assertEqual(set(result.keys()), expected)
         changes = result["Changes"]
         self.assertEqual(set(changes.keys()), {"ProcessSpikes", "ServiceCrashes", "BurstEvents", "StorageAlerts"})
@@ -2124,6 +2131,12 @@ _TRIAGE_EVENTS = [
 class TriageBundleToolTests(unittest.TestCase):
     """Tests for get_umi_triage_bundle (Issue #12)."""
 
+    def tearDown(self):
+        """Clear the TTL cache between tests to prevent cross-test contamination."""
+        import umi_mcp.server as _srv
+        _srv._triage_cache["result"] = None
+        _srv._triage_cache["expires_at"] = 0.0
+
     def _call(self, uptime=None, processes=None, disks=None, services=None, events=None, now=None):
         mock_now = now or _NOW_RC
         with patch("umi_mcp.server.get_uptime",  return_value=_TRIAGE_UPTIME if uptime is None else uptime), \
@@ -2224,6 +2237,670 @@ class TriageBundleToolTests(unittest.TestCase):
         )
         combined = " ".join(result["Highlights"])
         self.assertIn("CPU", combined)
+
+
+class TimingTests(unittest.TestCase):
+    """Issue #14: every endpoint includes CollectionTimeMs or a Timing dict."""
+
+    # --- simple (array) endpoints ---
+
+    @patch("umi_mcp.server.get_disk", return_value=[])
+    def test_disk_has_collection_time_ms(self, _):
+        result = get_umi_disk()
+        self.assertIn("CollectionTimeMs", result)
+        self.assertIsInstance(result["CollectionTimeMs"], float)
+
+    @patch("umi_mcp.server.get_network", return_value=[])
+    def test_network_has_collection_time_ms(self, _):
+        result = get_umi_network()
+        self.assertIn("CollectionTimeMs", result)
+
+    @patch("umi_mcp.server.get_process", return_value=[])
+    def test_process_has_collection_time_ms(self, _):
+        result = get_umi_process()
+        self.assertIn("CollectionTimeMs", result)
+
+    @patch("umi_mcp.server.get_uptime", return_value={"Hostname": "h"})
+    def test_uptime_has_collection_time_ms(self, _):
+        result = get_umi_uptime()
+        self.assertIn("CollectionTimeMs", result)
+        self.assertIsInstance(result["CollectionTimeMs"], float)
+
+    @patch("umi_mcp.server.get_user", return_value=[])
+    def test_user_has_collection_time_ms(self, _):
+        result = get_umi_user()
+        self.assertIn("CollectionTimeMs", result)
+
+    @patch("umi_mcp.server.get_service", return_value=[])
+    def test_service_has_collection_time_ms(self, _):
+        result = get_umi_service()
+        self.assertIn("CollectionTimeMs", result)
+
+    @patch("umi_mcp.server.get_events", return_value=[])
+    def test_events_has_collection_time_ms(self, _):
+        result = get_umi_events()
+        self.assertIn("CollectionTimeMs", result)
+
+    # --- aggregate endpoints have Timing dict ---
+
+    @patch("umi_mcp.server.get_events", return_value=[])
+    @patch("umi_mcp.server.datetime")
+    def test_event_summary_has_timing(self, mock_dt, _):
+        mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.timezone = timezone
+        result = get_umi_event_summary()
+        self.assertIn("Timing", result)
+        timing = result["Timing"]
+        self.assertIn("EventsMs", timing)
+        self.assertIn("TotalMs", timing)
+        self.assertIsInstance(timing["TotalMs"], float)
+
+    @patch("umi_mcp.server.get_uptime", return_value={"Hostname": "h"})
+    @patch("umi_mcp.server.get_process", return_value=[])
+    @patch("umi_mcp.server.get_disk", return_value=[])
+    @patch("umi_mcp.server.get_service", return_value=[])
+    @patch("umi_mcp.server.get_events", return_value=[])
+    @patch("umi_mcp.server.datetime")
+    def test_recent_changes_has_timing(self, mock_dt, *_):
+        mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.timezone = timezone
+        result = get_umi_recent_changes()
+        self.assertIn("Timing", result)
+        for key in ("UptimeMs", "ProcessMs", "DiskMs", "ServiceMs", "EventsMs", "TotalMs"):
+            self.assertIn(key, result["Timing"], msg=f"Missing Timing.{key}")
+
+    @patch("umi_mcp.server.get_service", return_value=[])
+    @patch("umi_mcp.server.get_events", return_value=[])
+    @patch("umi_mcp.server.platform.system", return_value="Linux")
+    @patch("umi_mcp.server.datetime")
+    def test_service_health_has_timing(self, mock_dt, *_):
+        mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+        mock_dt.fromisoformat = datetime.fromisoformat
+        mock_dt.timezone = timezone
+        result = get_umi_service_health()
+        self.assertIn("Timing", result)
+        for key in ("ServiceMs", "EventsMs", "TotalMs"):
+            self.assertIn(key, result["Timing"], msg=f"Missing Timing.{key}")
+
+
+class NoiseClassificationTests(unittest.TestCase):
+    """Issue #13: event groups carry a Classification field."""
+
+    def _call(self, raw_events=None, **kwargs):
+        if raw_events is None:
+            raw_events = []
+        with patch("umi_mcp.server.get_events", return_value=raw_events), \
+             patch("umi_mcp.server.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.timezone = timezone
+            return get_umi_event_summary(**kwargs)
+
+    def _one_event(self, source, event_id, level="Warning"):
+        return [{"Timestamp": "2026-03-16T11:00:00+00:00",
+                 "Level": level, "Source": source, "EventId": event_id, "Message": "x"}]
+
+    def test_distributedcom_classified_noise(self):
+        result = self._call(raw_events=self._one_event("DistributedCOM", 10016))
+        self.assertEqual(result["Groups"][0]["Classification"], "noise")
+
+    def test_known_noise_id_classified_noise(self):
+        # EventId 10016 is noise regardless of source
+        result = self._call(raw_events=self._one_event("SomeSource", 10016))
+        self.assertEqual(result["Groups"][0]["Classification"], "noise")
+
+    def test_error_level_classified_actionable(self):
+        result = self._call(raw_events=self._one_event("Disk", 51, level="Error"))
+        self.assertEqual(result["Groups"][0]["Classification"], "actionable")
+
+    def test_high_count_classified_actionable(self):
+        events = [
+            {"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Warning",
+             "Source": "SomeSource", "EventId": 999, "Message": "x"}
+        ] * 10
+        result = self._call(raw_events=events)
+        self.assertEqual(result["Groups"][0]["Classification"], "actionable")
+
+    def test_low_count_warning_classified_watch(self):
+        result = self._call(raw_events=self._one_event("SomeSource", 999, level="Warning"))
+        self.assertEqual(result["Groups"][0]["Classification"], "watch")
+
+    def test_critical_level_classified_actionable(self):
+        result = self._call(raw_events=self._one_event("System", 41, level="Critical"))
+        self.assertEqual(result["Groups"][0]["Classification"], "actionable")
+
+    def test_none_source_none_id_does_not_raise(self):
+        events = [{"Timestamp": "2026-03-16T11:00:00+00:00", "Level": "Warning",
+                   "Source": None, "EventId": None, "Message": "x"}]
+        result = self._call(raw_events=events)
+        self.assertEqual(len(result["Groups"]), 1)
+        self.assertIn(result["Groups"][0]["Classification"], {"noise", "watch", "actionable"})
+
+    def test_triage_bundle_top_events_have_classification(self):
+        import umi_mcp.server as _srv
+        _srv._triage_cache["result"] = None
+        _srv._triage_cache["expires_at"] = 0.0
+        with patch("umi_mcp.server.get_uptime", return_value={"Hostname": "h", "TotalMemoryBytes": None, "MemoryUsedBytes": None, "CpuPercentOverall": None, "LoadAverage1m": None, "OS": "Windows", "UptimeSeconds": 0}), \
+             patch("umi_mcp.server.get_process", return_value=[]), \
+             patch("umi_mcp.server.get_disk", return_value=[]), \
+             patch("umi_mcp.server.get_service", return_value=[]), \
+             patch("umi_mcp.server.get_events", return_value=[
+                 {"Timestamp": "2026-03-16T11:30:00+00:00", "Level": "Error",
+                  "Source": "Disk", "EventId": 51, "Message": "err"}
+             ]), \
+             patch("umi_mcp.server.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc)
+            mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt.timezone = timezone
+            result = get_umi_triage_bundle()
+        _srv._triage_cache["result"] = None
+        _srv._triage_cache["expires_at"] = 0.0
+        self.assertGreater(len(result["TopEvents"]), 0)
+        for event in result["TopEvents"]:
+            self.assertIn("Classification", event)
+
+
+class ProcessTrendsToolTests(unittest.TestCase):
+    """Issue #7: get_umi_process_trends two-sample comparison endpoint."""
+
+    _SNAP1 = [
+        {"ProcessName": "chrome", "ProcessId": 10, "CpuPercent": 20.0, "MemoryBytes": 500_000_000},
+        {"ProcessName": "idle",   "ProcessId": 20, "CpuPercent": 1.0,  "MemoryBytes": 10_000_000},
+        {"ProcessName": "gone",   "ProcessId": 30, "CpuPercent": 5.0,  "MemoryBytes": 50_000_000},
+    ]
+    _SNAP2 = [
+        {"ProcessName": "chrome",   "ProcessId": 10, "CpuPercent": 35.0, "MemoryBytes": 600_000_000},
+        {"ProcessName": "idle",     "ProcessId": 20, "CpuPercent": 1.5,  "MemoryBytes": 10_000_000},
+        {"ProcessName": "newcomer", "ProcessId": 40, "CpuPercent": 10.0, "MemoryBytes": 20_000_000},
+        # pid 30 ("gone") does not appear in snap2
+    ]
+
+    def _call(self, snap1=None, snap2=None, **kwargs):
+        snap1 = snap1 if snap1 is not None else self._SNAP1
+        snap2 = snap2 if snap2 is not None else self._SNAP2
+        with patch("umi_mcp.server.get_process", side_effect=[snap1, snap2]), \
+             patch("umi_mcp.server.time.sleep"):
+            return get_umi_process_trends(**kwargs)
+
+    def test_returns_array_envelope(self):
+        result = self._call()
+        self.assertEqual(result["SchemaVersion"], "1")
+        self.assertIn("GeneratedAt", result)
+        self.assertIn("CollectionTimeMs", result)
+        self.assertIsInstance(result["Items"], list)
+        self.assertIsInstance(result["Count"], int)
+
+    def test_only_processes_in_both_snapshots_returned(self):
+        result = self._call()
+        pids = {item["ProcessId"] for item in result["Items"]}
+        # pid 10 and 20 appear in both — pid 30 (gone) and 40 (newcomer) should not
+        self.assertIn(10, pids)
+        self.assertIn(20, pids)
+        self.assertNotIn(30, pids)
+        self.assertNotIn(40, pids)
+
+    def test_item_shape(self):
+        result = self._call()
+        chrome = next(i for i in result["Items"] if i["ProcessId"] == 10)
+        expected_keys = {
+            "ProcessName", "ProcessId",
+            "CpuAvgPercent", "CpuMaxPercent", "CpuDeltaPercent",
+            "MemoryAvgBytes", "MemoryMaxBytes", "MemoryDeltaBytes",
+            "Trend",
+        }
+        self.assertEqual(set(chrome.keys()), expected_keys)
+
+    def test_cpu_fields_computed_correctly(self):
+        result = self._call()
+        chrome = next(i for i in result["Items"] if i["ProcessId"] == 10)
+        self.assertAlmostEqual(chrome["CpuAvgPercent"], 27.5, places=1)
+        self.assertAlmostEqual(chrome["CpuMaxPercent"], 35.0, places=1)
+        self.assertAlmostEqual(chrome["CpuDeltaPercent"], 15.0, places=1)
+
+    def test_memory_fields_computed_correctly(self):
+        result = self._call()
+        chrome = next(i for i in result["Items"] if i["ProcessId"] == 10)
+        self.assertEqual(chrome["MemoryAvgBytes"], 550_000_000)
+        self.assertEqual(chrome["MemoryMaxBytes"], 600_000_000)
+        self.assertEqual(chrome["MemoryDeltaBytes"], 100_000_000)
+
+    def test_increasing_trend_on_high_cpu_delta(self):
+        result = self._call()
+        chrome = next(i for i in result["Items"] if i["ProcessId"] == 10)
+        # CpuDelta = 15% > 5% threshold
+        self.assertEqual(chrome["Trend"], "Increasing")
+
+    def test_stable_trend_on_low_delta(self):
+        result = self._call()
+        idle = next(i for i in result["Items"] if i["ProcessId"] == 20)
+        # CpuDelta = 0.5%, MemDelta = 0 — both below thresholds
+        self.assertEqual(idle["Trend"], "Stable")
+
+    def test_decreasing_trend(self):
+        snap1 = [{"ProcessName": "p", "ProcessId": 1, "CpuPercent": 50.0, "MemoryBytes": 100_000_000}]
+        snap2 = [{"ProcessName": "p", "ProcessId": 1, "CpuPercent": 10.0, "MemoryBytes": 100_000_000}]
+        result = self._call(snap1=snap1, snap2=snap2)
+        self.assertEqual(result["Items"][0]["Trend"], "Decreasing")
+
+    def test_top_limits_results(self):
+        result = self._call(top=1)
+        self.assertLessEqual(len(result["Items"]), 1)
+        self.assertLessEqual(result["Count"], 1)
+
+    def test_default_sort_by_cpu_avg_descending(self):
+        result = self._call()
+        cpus = [i["CpuAvgPercent"] for i in result["Items"]]
+        self.assertEqual(cpus, sorted(cpus, reverse=True))
+
+    def test_sort_by_mem_avg(self):
+        result = self._call(sort="mem_avg")
+        mems = [i["MemoryAvgBytes"] for i in result["Items"]]
+        self.assertEqual(mems, sorted(mems, reverse=True))
+
+    def test_unknown_sort_falls_back_to_cpu_avg(self):
+        result = self._call(sort="unknown_sort_key")
+        # Should not raise, just default to cpu_avg ordering
+        self.assertIsInstance(result["Items"], list)
+
+    def test_sleep_called_between_samples(self):
+        with patch("umi_mcp.server.get_process", side_effect=[self._SNAP1, self._SNAP2]), \
+             patch("umi_mcp.server.time.sleep") as mock_sleep:
+            get_umi_process_trends()
+        mock_sleep.assert_called_once_with(1.5)
+
+    def test_empty_snap1_returns_no_items(self):
+        result = self._call(snap1=[], snap2=self._SNAP2)
+        self.assertEqual(result["Items"], [])
+        self.assertEqual(result["Count"], 0)
+
+    def test_increasing_trend_on_high_mem_delta(self):
+        # Memory delta > 50MB should also trigger Increasing (even with low CPU delta)
+        snap1 = [{"ProcessName": "p", "ProcessId": 1, "CpuPercent": 1.0, "MemoryBytes": 100_000_000}]
+        snap2 = [{"ProcessName": "p", "ProcessId": 1, "CpuPercent": 1.5, "MemoryBytes": 200_000_000}]
+        result = self._call(snap1=snap1, snap2=snap2)
+        self.assertEqual(result["Items"][0]["Trend"], "Increasing")
+
+
+class ProcessEnrichmentTests(unittest.TestCase):
+    """Issue #6: process enrichment fields and only_user_processes filter."""
+
+    @patch("umi_mcp.tools.process.time.sleep")
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    def test_parent_process_name_resolved(self, mock_iter, _sleep):
+        parent = MagicMock(info={
+            "pid": 1, "name": "init", "ppid": 0,
+            "memory_info": SimpleNamespace(rss=0), "memory_percent": 0.0,
+            "status": psutil.STATUS_RUNNING, "username": "root",
+            "create_time": 1.0, "cmdline": [], "num_threads": 1, "exe": "/sbin/init",
+        })
+        child = MagicMock(info={
+            "pid": 100, "name": "child", "ppid": 1,
+            "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
+            "status": psutil.STATUS_RUNNING, "username": "user",
+            "create_time": 1.0, "cmdline": ["child"], "num_threads": 1, "exe": "/usr/bin/child",
+        })
+        parent.cpu_percent.return_value = 0.0
+        child.cpu_percent.return_value = 1.0
+        mock_iter.return_value = [parent, child]
+
+        result = process.get_process()
+        child_rec = next(r for r in result if r["ProcessName"] == "child")
+        self.assertEqual(child_rec["ParentProcessName"], "init")
+
+    @patch("umi_mcp.tools.process.time.sleep")
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    def test_parent_process_name_null_when_ppid_not_in_list(self, mock_iter, _sleep):
+        proc = MagicMock(info={
+            "pid": 999, "name": "orphan", "ppid": 888,
+            "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
+            "status": psutil.STATUS_RUNNING, "username": "user",
+            "create_time": 1.0, "cmdline": [], "num_threads": 1, "exe": None,
+        })
+        proc.cpu_percent.return_value = 1.0
+        mock_iter.return_value = [proc]
+
+        result = process.get_process()
+        self.assertIsNone(result[0]["ParentProcessName"])
+
+    @patch("umi_mcp.tools.process.time.sleep")
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    def test_process_type_system_for_pid_4(self, mock_iter, _sleep):
+        proc = MagicMock(info={
+            "pid": 4, "name": "System", "ppid": 0,
+            "memory_info": SimpleNamespace(rss=0), "memory_percent": 0.0,
+            "status": psutil.STATUS_RUNNING, "username": "SYSTEM",
+            "create_time": 1.0, "cmdline": [], "num_threads": 1, "exe": None,
+        })
+        proc.cpu_percent.return_value = 0.0
+        mock_iter.return_value = [proc]
+
+        result = process.get_process()
+        self.assertEqual(result[0]["ProcessType"], "System")
+
+    @patch("umi_mcp.tools.process.time.sleep")
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    @patch("umi_mcp.tools.process.platform.system", return_value="Windows")
+    def test_process_type_system_for_system_account(self, _sys, mock_iter, _sleep):
+        proc = MagicMock(info={
+            "pid": 500, "name": "svchost", "ppid": 1,
+            "memory_info": SimpleNamespace(rss=1024), "memory_percent": 0.1,
+            "status": psutil.STATUS_RUNNING, "username": "NT AUTHORITY\\SYSTEM",
+            "create_time": 1.0, "cmdline": [], "num_threads": 4, "exe": "C:\\Windows\\system32\\svchost.exe",
+        })
+        proc.cpu_percent.return_value = 0.5
+        mock_iter.return_value = [proc]
+
+        result = process.get_process()
+        self.assertEqual(result[0]["ProcessType"], "System")
+
+    @patch("umi_mcp.tools.process.time.sleep")
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    def test_process_type_user_for_regular_process(self, mock_iter, _sleep):
+        proc = MagicMock(info={
+            "pid": 1234, "name": "chrome", "ppid": 1,
+            "memory_info": SimpleNamespace(rss=1024), "memory_percent": 0.1,
+            "status": psutil.STATUS_RUNNING, "username": "chris",
+            "create_time": 1.0, "cmdline": ["chrome"], "num_threads": 1, "exe": "/usr/bin/chrome",
+        })
+        proc.cpu_percent.return_value = 10.0
+        mock_iter.return_value = [proc]
+
+        result = process.get_process()
+        self.assertEqual(result[0]["ProcessType"], "User")
+
+    @patch("umi_mcp.tools.process.time.sleep")
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    def test_executable_path_populated(self, mock_iter, _sleep):
+        proc = MagicMock(info={
+            "pid": 1234, "name": "chrome", "ppid": 1,
+            "memory_info": SimpleNamespace(rss=1024), "memory_percent": 0.1,
+            "status": psutil.STATUS_RUNNING, "username": "chris",
+            "create_time": 1.0, "cmdline": ["chrome"], "num_threads": 1,
+            "exe": "/usr/bin/chrome",
+        })
+        proc.cpu_percent.return_value = 5.0
+        mock_iter.return_value = [proc]
+
+        result = process.get_process()
+        self.assertEqual(result[0]["ExecutablePath"], "/usr/bin/chrome")
+
+    @patch("umi_mcp.tools.process.time.sleep")
+    @patch("umi_mcp.tools.process.psutil.process_iter")
+    def test_publisher_and_service_name_null_v1(self, mock_iter, _sleep):
+        proc = MagicMock(info={
+            "pid": 1234, "name": "p", "ppid": 1,
+            "memory_info": SimpleNamespace(rss=512), "memory_percent": 0.1,
+            "status": psutil.STATUS_RUNNING, "username": "user",
+            "create_time": 1.0, "cmdline": [], "num_threads": 1, "exe": None,
+        })
+        proc.cpu_percent.return_value = 0.0
+        mock_iter.return_value = [proc]
+        result = process.get_process()
+        self.assertIsNone(result[0]["Publisher"])
+        self.assertIsNone(result[0]["ServiceName"])
+
+    @patch("umi_mcp.server.get_process", return_value=[
+        {"ProcessName": "chrome", "ProcessId": 1, "CpuPercent": 10.0, "MemoryBytes": 500_000,
+         "Status": "Running", "User": "chris", "ProcessType": "User"},
+        {"ProcessName": "svchost", "ProcessId": 2, "CpuPercent": 1.0, "MemoryBytes": 100_000,
+         "Status": "Running", "User": "SYSTEM", "ProcessType": "System"},
+    ])
+    def test_only_user_processes_filters_system(self, _):
+        result = get_umi_process(only_user_processes=True)
+        names = [i["ProcessName"] for i in result["Items"]]
+        self.assertIn("chrome", names)
+        self.assertNotIn("svchost", names)
+
+    @patch("umi_mcp.server.get_process", return_value=[
+        {"ProcessName": "chrome", "ProcessId": 1, "ProcessType": "User"},
+        {"ProcessName": "svchost", "ProcessId": 2, "ProcessType": "System"},
+    ])
+    def test_only_user_processes_false_returns_all(self, _):
+        result = get_umi_process(only_user_processes=False)
+        self.assertEqual(result["Count"], 2)
+
+
+class ServiceEnrichmentTests(unittest.TestCase):
+    """Issue #8: service enrichment fields and only_non_microsoft filter."""
+
+    from umi_mcp.server import _is_microsoft_service as _msvc
+
+    def test_publisher_field_in_windows_service(self):
+        with patch("umi_mcp.tools.service.subprocess.run") as mock_run, \
+             patch("umi_mcp.tools.service.platform.system", return_value="Windows"):
+            mock_run.return_value = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"Name": "svc", "State": "Running", "StartMode": "Auto",
+                                    "PathName": "C:\\Windows\\System32\\svc.exe"}]),
+            )
+            result = service.get_service()
+        self.assertIn("Publisher", result[0])
+        self.assertIsNone(result[0]["Publisher"])  # null in v1
+
+    def test_publisher_field_in_linux_service(self):
+        with patch("umi_mcp.tools.service.subprocess.run") as mock_run, \
+             patch("umi_mcp.tools.service.platform.system", return_value="Linux"):
+            mock_run.return_value = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"unit": "ssh.service", "description": "SSH",
+                                    "active": "active", "sub": "running"}]),
+            )
+            result = service.get_service()
+        self.assertIn("Publisher", result[0])
+        self.assertIsNone(result[0]["Publisher"])
+
+    def test_is_microsoft_service_windows_path(self):
+        from umi_mcp.server import _is_microsoft_service
+        self.assertTrue(_is_microsoft_service({"BinaryPath": "C:\\Windows\\System32\\svchost.exe"}))
+        self.assertTrue(_is_microsoft_service({"BinaryPath": '"C:\\Windows\\system32\\lsass.exe"'}))
+        self.assertTrue(_is_microsoft_service({"BinaryPath": "%SystemRoot%\\svchost.exe"}))
+
+    def test_is_microsoft_service_third_party_path(self):
+        from umi_mcp.server import _is_microsoft_service
+        self.assertFalse(_is_microsoft_service({"BinaryPath": "C:\\Program Files\\Acme\\svc.exe"}))
+        self.assertFalse(_is_microsoft_service({"BinaryPath": None}))
+        self.assertFalse(_is_microsoft_service({}))
+
+    @patch("umi_mcp.server.get_service", return_value=[
+        {"ServiceName": "acme", "BinaryPath": "C:\\Program Files\\Acme\\acme.exe",
+         "Status": "Running", "StartType": "Automatic", "DisplayName": "Acme"},
+        {"ServiceName": "svchost", "BinaryPath": "C:\\Windows\\System32\\svchost.exe",
+         "Status": "Running", "StartType": "Automatic", "DisplayName": "svchost"},
+    ])
+    def test_only_non_microsoft_filter(self, _):
+        result = get_umi_service(only_non_microsoft=True)
+        names = [i["ServiceName"] for i in result["Items"]]
+        self.assertIn("acme", names)
+        self.assertNotIn("svchost", names)
+
+    @patch("umi_mcp.server.get_service", return_value=[
+        {"ServiceName": "acme", "BinaryPath": "C:\\Program Files\\Acme\\acme.exe",
+         "Status": "Running", "StartType": "Automatic", "DisplayName": "Acme"},
+        {"ServiceName": "svchost", "BinaryPath": "C:\\Windows\\System32\\svchost.exe",
+         "Status": "Running", "StartType": "Automatic", "DisplayName": "svchost"},
+    ])
+    def test_only_non_microsoft_false_returns_all(self, _):
+        result = get_umi_service(only_non_microsoft=False)
+        self.assertEqual(result["Count"], 2)
+
+
+class NetworkEnrichmentTests(unittest.TestCase):
+    """Issue #10: IsDefaultRoute, RouteMetric, IsVpn fields."""
+
+    def _make_interface(self, name, is_up=True, ipv4="10.0.0.1"):
+        from types import SimpleNamespace
+        addrs = {name: [SimpleNamespace(family=socket.AF_INET, address=ipv4, netmask="255.255.255.0", prefixlen=24)]}
+        stats = {name: SimpleNamespace(isup=is_up, speed=1000)}
+        io = {}
+        return addrs, stats, io
+
+    @patch("umi_mcp.tools.network.psutil.net_io_counters", return_value={})
+    @patch("umi_mcp.tools.network.psutil.net_if_stats")
+    @patch("umi_mcp.tools.network.psutil.net_if_addrs")
+    @patch("umi_mcp.tools.network._load_network_extras")
+    def test_is_default_route_true_for_gateway_interface(self, mock_extras, mock_addrs, mock_stats, _):
+        mock_extras.return_value = ("192.168.1.1", "eth0", 100, [])
+        mock_addrs.return_value = {"eth0": [SimpleNamespace(family=socket.AF_INET, address="10.0.0.1", netmask="255.255.255.0")]}
+        mock_stats.return_value = {"eth0": SimpleNamespace(isup=True, speed=1000)}
+
+        result = network.get_network()
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0]["IsDefaultRoute"])
+        self.assertEqual(result[0]["RouteMetric"], 100)
+
+    @patch("umi_mcp.tools.network.psutil.net_io_counters", return_value={})
+    @patch("umi_mcp.tools.network.psutil.net_if_stats")
+    @patch("umi_mcp.tools.network.psutil.net_if_addrs")
+    @patch("umi_mcp.tools.network._load_network_extras")
+    def test_is_default_route_false_for_other_interfaces(self, mock_extras, mock_addrs, mock_stats, _):
+        mock_extras.return_value = ("192.168.1.1", "eth0", 100, [])
+        mock_addrs.return_value = {
+            "eth0": [SimpleNamespace(family=socket.AF_INET, address="10.0.0.1", netmask="255.255.255.0")],
+            "eth1": [SimpleNamespace(family=socket.AF_INET, address="10.0.1.1", netmask="255.255.255.0")],
+        }
+        mock_stats.return_value = {
+            "eth0": SimpleNamespace(isup=True, speed=1000),
+            "eth1": SimpleNamespace(isup=True, speed=1000),
+        }
+
+        result = network.get_network()
+        eth0 = next(r for r in result if r["InterfaceName"] == "eth0")
+        eth1 = next(r for r in result if r["InterfaceName"] == "eth1")
+        self.assertTrue(eth0["IsDefaultRoute"])
+        self.assertFalse(eth1["IsDefaultRoute"])
+        self.assertEqual(eth0["RouteMetric"], 100)
+        self.assertIsNone(eth1["RouteMetric"])
+
+    @patch("umi_mcp.tools.network.psutil.net_io_counters", return_value={})
+    @patch("umi_mcp.tools.network.psutil.net_if_stats")
+    @patch("umi_mcp.tools.network.psutil.net_if_addrs")
+    @patch("umi_mcp.tools.network._load_network_extras")
+    def test_is_vpn_true_for_tunnel_interface(self, mock_extras, mock_addrs, mock_stats, _):
+        mock_extras.return_value = (None, None, None, [])
+        mock_addrs.return_value = {"tun0": [SimpleNamespace(family=socket.AF_INET, address="10.8.0.1", netmask="255.255.255.0")]}
+        mock_stats.return_value = {"tun0": SimpleNamespace(isup=True, speed=0)}
+
+        result = network.get_network()
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0]["IsVpn"])
+        self.assertEqual(result[0]["InterfaceType"], "Tunnel")
+
+    @patch("umi_mcp.tools.network.psutil.net_io_counters", return_value={})
+    @patch("umi_mcp.tools.network.psutil.net_if_stats")
+    @patch("umi_mcp.tools.network.psutil.net_if_addrs")
+    @patch("umi_mcp.tools.network._load_network_extras")
+    def test_is_vpn_false_for_ethernet(self, mock_extras, mock_addrs, mock_stats, _):
+        mock_extras.return_value = (None, None, None, [])
+        mock_addrs.return_value = {"eth0": [SimpleNamespace(family=socket.AF_INET, address="10.0.0.1", netmask="255.255.255.0")]}
+        mock_stats.return_value = {"eth0": SimpleNamespace(isup=True, speed=1000)}
+
+        result = network.get_network()
+        self.assertFalse(result[0]["IsVpn"])
+
+    @patch("umi_mcp.tools.network.psutil.net_io_counters", return_value={})
+    @patch("umi_mcp.tools.network.psutil.net_if_stats")
+    @patch("umi_mcp.tools.network.psutil.net_if_addrs")
+    @patch("umi_mcp.tools.network._load_network_extras")
+    def test_route_metric_null_when_no_gateway(self, mock_extras, mock_addrs, mock_stats, _):
+        mock_extras.return_value = (None, None, None, [])
+        mock_addrs.return_value = {"eth0": [SimpleNamespace(family=socket.AF_INET, address="10.0.0.1", netmask="255.255.255.0")]}
+        mock_stats.return_value = {"eth0": SimpleNamespace(isup=True, speed=1000)}
+
+        result = network.get_network()
+        self.assertIsNone(result[0]["RouteMetric"])
+        self.assertFalse(result[0]["IsDefaultRoute"])
+
+    def test_load_default_gateway_linux_parses_metric(self):
+        with patch("umi_mcp.tools.network.subprocess.run") as mock_run:
+            mock_run.return_value = SimpleNamespace(
+                returncode=0,
+                stdout="default via 192.168.1.1 dev eth0 proto dhcp metric 100\n",
+            )
+            gw, iface, metric = network._load_default_gateway_linux()
+        self.assertEqual(gw, "192.168.1.1")
+        self.assertEqual(iface, "eth0")
+        self.assertEqual(metric, 100)
+
+    def test_load_default_gateway_linux_no_metric(self):
+        with patch("umi_mcp.tools.network.subprocess.run") as mock_run:
+            mock_run.return_value = SimpleNamespace(
+                returncode=0,
+                stdout="default via 10.0.0.1 dev wlan0\n",
+            )
+            gw, iface, metric = network._load_default_gateway_linux()
+        self.assertEqual(gw, "10.0.0.1")
+        self.assertIsNone(metric)
+
+    def test_load_default_gateway_windows_returns_metric(self):
+        with patch("umi_mcp.tools.network.subprocess.run") as mock_run:
+            mock_run.return_value = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"NextHop": "192.168.1.1", "InterfaceAlias": "Ethernet", "RouteMetric": 25}),
+            )
+            gw, iface, metric = network._load_default_gateway_windows()
+        self.assertEqual(gw, "192.168.1.1")
+        self.assertEqual(iface, "Ethernet")
+        self.assertEqual(metric, 25)
+
+
+class TriageBundleTimingTests(unittest.TestCase):
+    """Triage bundle TTL cache and Timing dict."""
+
+    def tearDown(self):
+        import umi_mcp.server as _srv
+        _srv._triage_cache["result"] = None
+        _srv._triage_cache["expires_at"] = 0.0
+
+    def _patch_all(self):
+        return [
+            patch("umi_mcp.server.get_uptime", return_value={
+                "Hostname": "h", "OS": "W", "UptimeSeconds": 0,
+                "CpuPercentOverall": None, "TotalMemoryBytes": None,
+                "MemoryUsedBytes": None, "LoadAverage1m": None,
+            }),
+            patch("umi_mcp.server.get_process", return_value=[]),
+            patch("umi_mcp.server.get_disk", return_value=[]),
+            patch("umi_mcp.server.get_service", return_value=[]),
+            patch("umi_mcp.server.get_events", return_value=[]),
+            patch("umi_mcp.server.datetime", **{
+                "now.return_value": datetime(2026, 3, 16, 12, 0, 0, tzinfo=timezone.utc),
+                "fromisoformat": datetime.fromisoformat,
+                "timezone": timezone,
+            }),
+        ]
+
+    def test_triage_bundle_has_timing(self):
+        import umi_mcp.server as _srv
+        _srv._triage_cache["result"] = None
+        _srv._triage_cache["expires_at"] = 0.0
+        patches = self._patch_all()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            result = get_umi_triage_bundle()
+        self.assertIn("Timing", result)
+        for key in ("UptimeMs", "ProcessMs", "DiskMs", "ServiceMs", "EventsMs", "TotalMs"):
+            self.assertIn(key, result["Timing"], msg=f"Missing Timing.{key}")
+
+    def test_triage_cache_returns_same_object(self):
+        import umi_mcp.server as _srv
+        _srv._triage_cache["result"] = None
+        _srv._triage_cache["expires_at"] = 0.0
+        patches = self._patch_all()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            result1 = get_umi_triage_bundle()
+            result2 = get_umi_triage_bundle()
+        # Second call should return the cached object (same identity)
+        self.assertIs(result1, result2)
+
+    def test_triage_cache_bypassed_when_expired(self):
+        import umi_mcp.server as _srv
+        _srv._triage_cache["result"] = {"cached": True}
+        _srv._triage_cache["expires_at"] = 0.0  # already expired
+        patches = self._patch_all()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            result = get_umi_triage_bundle()
+        self.assertNotIn("cached", result)
 
 
 if __name__ == "__main__":
