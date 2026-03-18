@@ -7,9 +7,21 @@
 [![Platform](https://img.shields.io/badge/platform-windows%20|%20linux%20|%20macos-lightgrey)]()
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple)](https://modelcontextprotocol.io)
 
-**A Python MCP server that gives AI assistants live awareness of the machine they're running on.**
+**A Python MCP server for local machine inspection from MCP-compatible AI clients.**
 
-Ask your AI assistant how much disk space is left, what's using the most memory, or whether any services have crashed recently — and get a real answer, not a suggested command to run yourself.
+UMI is currently functional, but it is **not performance-ready** for the fast "what is wrong with this machine right now?" workflow. Core calls work, but response times can still be materially slower than native tools like Task Manager, Resource Monitor, or Event Viewer.
+
+If you need instant triage on Windows today, use native system tools first. UMI is best treated as an experimental MCP integration layer while the fast path is rebuilt.
+
+---
+
+## Current Status
+
+- Core MCP calls are working again: `get_umi_uptime`, `get_umi_disk`, `get_umi_process`
+- The broader composite/summary direction has been intentionally pulled back
+- The next intended milestone is a **fast triage** path that returns in a few seconds, not a rich observability layer
+
+This repository remains public because the implementation is real and usable, but the current state should be read as **functional recovery baseline**, not polished product.
 
 ---
 
@@ -25,7 +37,7 @@ AI: "C: is at 75% capacity, RAM is 87% used (866 MB free of 8 GB),
      week according to the event log. Everything else looks normal."
 ```
 
-That response required no commands, no copy-pasting, and no prompting the user to open Task Manager. The AI queried the machine directly, assembled the picture, and answered in plain language.
+That is the intended interaction model, but it is not yet a reliable performance claim. At the moment, UMI should be evaluated as an experimental MCP server, not as a faster replacement for native system tools.
 
 ---
 
@@ -139,9 +151,9 @@ The pattern is the same for all MCP clients — point the client at `python -m u
 
 | OS | Status |
 |----|--------|
-| Windows 10/11 | Full support |
-| Linux (systemd) | Full support |
-| macOS 13+ | Full support |
+| Windows 10/11 | Functional, performance work in progress |
+| Linux (systemd) | Functional, less exercised |
+| macOS 13+ | Functional, less exercised |
 
 The MCP server uses [psutil](https://psutil.readthedocs.io/) for cross-platform system queries and falls back gracefully where platform-specific data isn't available (returning `null` rather than erroring).
 
@@ -194,6 +206,20 @@ pytest mcp-server/tests/ --cov=umi_mcp --cov-report=term-missing
 
 ## Known Limitations
 
+### Performance and operator workflow
+
+UMI is currently too slow for the strict "faster than opening Task Manager" standard.
+That is a meaningful limitation, not just a polish issue.
+
+The project drifted toward richer MCP summaries and cross-platform enrichment before
+locking down a truly fast baseline. The current reset direction is:
+
+- keep the core local inspection tools working
+- avoid broad composite endpoints for now
+- rebuild around a narrow fast-triage path with a target response time of a few seconds
+
+Until that work is done, native OS tools remain the better choice for immediate triage.
+
 ### Windows: virtual/cloud-mounted drives may report identical disk stats
 
 On Windows, virtual drives (e.g. Google Drive, OneDrive, network shares) are
@@ -219,6 +245,21 @@ The most useful contributions right now:
 - **Client compatibility reports** — does it work with a client not listed above?
 
 File an issue or open a PR.
+
+---
+
+## Reset Direction
+
+The next useful version of UMI should probably be much smaller:
+
+- top CPU processes
+- top memory processes
+- overall CPU and memory pressure
+- disk free/used percentage
+- recent critical or error events
+
+If that fast path cannot reliably beat or closely match the feel of opening a native
+system monitor, then the design should be reconsidered before layering on more features.
 
 ---
 
