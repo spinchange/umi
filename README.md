@@ -18,6 +18,7 @@ If you need instant triage on Windows today, use native system tools first. UMI 
 ## Current Status
 
 - Core MCP calls are working again: `get_umi_uptime`, `get_umi_disk`, `get_umi_process`
+- A new narrow fast path exists: `get_umi_fast_triage`
 - The broader composite/summary direction has been intentionally pulled back
 - The next intended milestone is a **fast triage** path that returns in a few seconds, not a rich observability layer
 
@@ -52,6 +53,7 @@ That is the intended interaction model, but it is not yet a reliable performance
 | `get_umi_service` | System services — Windows Services, systemd units, launchd agents — with status and start type |
 | `get_umi_user` | Local user accounts — groups, admin status, home directory |
 | `get_umi_events` | Recent system log entries — Windows Event Log, journald, macOS unified log — filterable by level and source |
+| `get_umi_fast_triage` | Small fast snapshot for operator triage — overall CPU, memory pressure, top disks, top CPU-time processes, top memory processes |
 
 All tools return structured JSON conforming to the [UMI schemas](./schema/). Data is cross-platform and normalized — the same property names and types regardless of OS.
 
@@ -257,6 +259,8 @@ The next useful version of UMI should probably be much smaller:
 - overall CPU and memory pressure
 - disk free/used percentage
 - recent critical or error events
+
+That reset has started with `get_umi_fast_triage`, which is intentionally much narrower than the older composite direction.
 
 If that fast path cannot reliably beat or closely match the feel of opening a native
 system monitor, then the design should be reconsidered before layering on more features.

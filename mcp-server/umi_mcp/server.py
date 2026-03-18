@@ -1,5 +1,12 @@
-from mcp.server.fastmcp import FastMCP
+import json
+import platform
+import socket
+import subprocess
+import time
 from datetime import datetime, timedelta, timezone
+
+import psutil
+from mcp.server.fastmcp import FastMCP
 
 from .tools.disk import get_disk
 from .tools.events import get_events
@@ -27,6 +34,143 @@ _LEVEL_ORDER = {
     "Verbose": 4,
     "Unknown": 5,
 }
+
+_FAST_TRIAGE_TIMEOUT_SECONDS = 6
+def _safe_percent(numerator: int | float | None, denominator: int | float | None) -> float | None:
+    if denominator in (None, 0):
+        return None
+    if numerator is None:
+        return None
+    return round((numerator / denominator) * 100, 1)
+
+
+def _fast_uptime_snapshot() -> dict:
+    boot_ts = psutil.boot_time()
+    boot_dt = datetime.fromtimestamp(boot_ts, tz=timezone.utc)
+    now = datetime.now(tz=timezone.utc)
+    uptime_secs = int((now - boot_dt).total_seconds())
+
+    mem = psutil.virtual_memory()
+    cpu_percent = psutil.cpu_percent(interval=None)
+
+    return {
+        "Hostname": socket.gethostname(),
+        "OS": platform.system(),
+        "OSVersion": platform.version(),
+        "BootTime": boot_dt.isoformat(),
+        "UptimeSeconds": uptime_secs,
+        "CpuPercentOverall": round(cpu_percent, 1),
+        "TotalMemoryBytes": mem.total,
+        "MemoryUsedBytes": mem.used,
+        "MemoryAvailableBytes": mem.available,
+        "MemoryUsedPercent": _safe_percent(mem.used, mem.total),
+    }
+
+
+def _fast_disk_snapshot(top: int) -> list[dict]:
+    items = []
+    for part in psutil.disk_partitions(all=False):
+        mount = getattr(part, "mountpoint", None)
+        if not mount:
+            continue
+        try:
+            usage = psutil.disk_usage(mount)
+        except (PermissionError, OSError):
+            continue
+        items.append({
+            "DeviceName": part.device,
+            "MountPoint": mount,
+            "UsedPercent": round(usage.percent, 1),
+            "FreeBytes": usage.free,
+            "TotalBytes": usage.total,
+        })
+
+    items.sort(key=lambda d: d["UsedPercent"], reverse=True)
+    return items[:top]
+
+
+def _load_fast_processes_windows(top: int) -> tuple[list[dict], list[dict]]:
+    ps_cmd = (
+        "Get-Process "
+        "| Select-Object ProcessName, Id, CPU, WS "
+        "| ConvertTo-Json -Compress"
+    )
+
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=_FAST_TRIAGE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return [], []
+
+    if out.returncode != 0 or not out.stdout.strip():
+        return [], []
+
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return [], []
+
+    if isinstance(data, dict):
+        data = [data]
+
+    results = []
+    for item in data:
+        try:
+            pid = int(item.get("Id"))
+        except (TypeError, ValueError):
+            pid = None
+        try:
+            cpu_seconds = float(item.get("CPU") or 0.0)
+        except (TypeError, ValueError):
+            cpu_seconds = 0.0
+        try:
+            memory_bytes = int(item.get("WS") or 0)
+        except (TypeError, ValueError):
+            memory_bytes = 0
+
+        results.append({
+            "ProcessName": item.get("ProcessName"),
+            "ProcessId": pid,
+            "CpuTimeSeconds": round(cpu_seconds, 1),
+            "MemoryBytes": memory_bytes,
+        })
+
+    top_cpu = sorted(results, key=lambda p: p["CpuTimeSeconds"], reverse=True)[:top]
+    top_memory = sorted(results, key=lambda p: p["MemoryBytes"], reverse=True)[:top]
+    return top_cpu, top_memory
+
+
+def _load_fast_processes_generic(top: int) -> tuple[list[dict], list[dict]]:
+    items = []
+    for proc in psutil.process_iter(["pid", "name", "cpu_times", "memory_info"], ad_value=None):
+        info = proc.info
+        if not info.get("name"):
+            continue
+        cpu_times = info.get("cpu_times")
+        mem_info = info.get("memory_info")
+        cpu_total = (cpu_times.user + cpu_times.system) if cpu_times else 0.0
+        memory_bytes = mem_info.rss if mem_info else 0
+        items.append({
+            "ProcessName": info["name"],
+            "ProcessId": info["pid"],
+            "CpuTimeSeconds": round(cpu_total, 1),
+            "MemoryBytes": memory_bytes,
+        })
+
+    top_cpu = sorted(items, key=lambda p: p["CpuTimeSeconds"], reverse=True)[:top]
+    top_memory = sorted(items, key=lambda p: p["MemoryBytes"], reverse=True)[:top]
+    return top_cpu, top_memory
+
+
+def _fast_process_snapshot(top: int) -> tuple[list[dict], list[dict]]:
+    if platform.system() == "Windows":
+        return _load_fast_processes_windows(top)
+    return _load_fast_processes_generic(top)
 
 
 def _apply_verbosity(items: list[dict], verbosity: str, summary_fields: frozenset) -> list[dict]:
@@ -414,4 +558,58 @@ def get_umi_recent_changes(lookback_hours: int = 4) -> dict:
             "BurstEvents": burst_events,
             "StorageAlerts": storage_alerts,
         },
+    }
+
+
+@mcp.tool()
+def get_umi_fast_triage(top_processes: int = 5, top_disks: int = 3) -> dict:
+    """
+    Returns a deliberately small, faster triage snapshot for "what matters right now?"
+    This endpoint avoids the broader enrichment/composite path and focuses on:
+    CPU, memory, most-used disks, top CPU-time processes, and top memory processes.
+    Intended for fast operator triage rather than deep analysis.
+    """
+    t0 = time.perf_counter()
+
+    uptime_data = _fast_uptime_snapshot()
+    disk_data = _fast_disk_snapshot(top_disks)
+    top_cpu, top_memory = _fast_process_snapshot(top_processes)
+
+    highlights = []
+    cpu_pct = uptime_data.get("CpuPercentOverall")
+    mem_pct = uptime_data.get("MemoryUsedPercent")
+    if cpu_pct is not None:
+        highlights.append(f"CPU {cpu_pct}%")
+    if mem_pct is not None:
+        highlights.append(f"Memory {mem_pct}% used")
+    if disk_data:
+        hottest_disk = disk_data[0]
+        label = hottest_disk.get("DeviceName") or hottest_disk.get("MountPoint") or "disk"
+        highlights.append(f"Disk {label} {hottest_disk.get('UsedPercent')}% used")
+    if top_cpu:
+        highlights.append(
+            f"Top CPU time: {top_cpu[0].get('ProcessName')} ({top_cpu[0].get('CpuTimeSeconds')}s)"
+        )
+    if top_memory:
+        mem_mb = round((top_memory[0].get("MemoryBytes") or 0) / (1024 * 1024), 1)
+        highlights.append(
+            f"Top memory: {top_memory[0].get('ProcessName')} ({mem_mb} MB)"
+        )
+
+    return {
+        "SchemaVersion": _SCHEMA_VERSION,
+        "GeneratedAt": datetime.now(tz=timezone.utc).isoformat(),
+        "Hostname": uptime_data.get("Hostname"),
+        "OS": uptime_data.get("OS"),
+        "OSVersion": uptime_data.get("OSVersion"),
+        "BootTime": uptime_data.get("BootTime"),
+        "UptimeSeconds": uptime_data.get("UptimeSeconds"),
+        "CpuPercentOverall": uptime_data.get("CpuPercentOverall"),
+        "MemoryUsedPercent": uptime_data.get("MemoryUsedPercent"),
+        "MemoryAvailableBytes": uptime_data.get("MemoryAvailableBytes"),
+        "Disks": disk_data,
+        "TopCpuProcesses": top_cpu,
+        "TopMemoryProcesses": top_memory,
+        "Highlights": highlights,
+        "CollectionTimeMs": round((time.perf_counter() - t0) * 1000, 1),
     }
