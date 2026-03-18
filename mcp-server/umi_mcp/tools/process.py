@@ -15,41 +15,66 @@ STATUS_MAP = {
     psutil.STATUS_PARKED: "Sleeping",
 }
 
-ATTRS = [
-    "pid", "name", "ppid", "memory_info",
-    "memory_percent", "status", "username", "create_time",
-    "cmdline", "num_threads", "exe",
-]
+LIGHT_ATTRS = ["pid", "name", "cpu_times"]
 
 CPU_SAMPLE_INTERVAL = 0.5
-
-# Usernames that indicate a kernel or OS-owned process on Windows and Unix.
-_SYSTEM_USERNAMES = frozenset({
-    "system",
-    "nt authority\\system",
-    "nt authority\\network service",
-    "nt authority\\local service",
-    "local service",
-    "network service",
-    "root",
-})
+MIN_CANDIDATE_COUNT = 24
+CPU_CANDIDATE_MULTIPLIER = 4
 
 
-def _classify_process_type(username: "str | None", pid: int) -> str:
-    """Return 'System' for kernel/OS-owned processes; 'User' for everything else."""
-    if pid <= 4:
-        return "System"
-    if (username or "").lower() in _SYSTEM_USERNAMES:
-        return "System"
-    return "User"
+def _get_process_details(proc: psutil.Process) -> dict:
+    try:
+        info = proc.as_dict(
+            attrs=[
+                "ppid", "memory_info", "memory_percent", "status",
+                "username", "create_time", "num_threads", "cmdline",
+            ],
+            ad_value=None,
+        )
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return {
+            "ParentProcessId": None,
+            "MemoryBytes": 0,
+            "MemoryPercent": None,
+            "Status": "Unknown",
+            "User": None,
+            "StartTime": None,
+            "CommandLine": None,
+            "ThreadCount": None,
+        }
+
+    start_time = None
+    if info.get("create_time"):
+        try:
+            start_time = datetime.fromtimestamp(
+                info["create_time"], tz=timezone.utc
+            ).isoformat()
+        except (OSError, ValueError, OverflowError):
+            pass
+
+    mem_info = info.get("memory_info")
+    cmdline = " ".join(info["cmdline"]) if info.get("cmdline") else None
+    status = STATUS_MAP.get(info.get("status", ""), "Unknown")
+
+    return {
+        "ParentProcessId": info.get("ppid"),
+        "MemoryBytes": mem_info.rss if mem_info else 0,
+        "MemoryPercent": round(info["memory_percent"], 1) if info.get("memory_percent") else None,
+        "Status": status,
+        "User": info.get("username"),
+        "StartTime": start_time,
+        "CommandLine": cmdline,
+        "ThreadCount": info.get("num_threads"),
+    }
 
 
-def get_process(name: str = None, top: int = None) -> list[dict]:
+def get_process(name: str = None, top: int = None, include_command_line: bool = True) -> list[dict]:
     is_windows = platform.system() == "Windows"
 
-    # Pass 1: collect processes and prime per-process cpu_percent baseline
+    # Pass 1: collect lightweight process data and rank by cumulative CPU time.
+    # We only do live cpu_percent sampling for a bounded candidate set.
     procs = []
-    for proc in psutil.process_iter(ATTRS, ad_value=None):
+    for proc in psutil.process_iter(LIGHT_ATTRS, ad_value=None):
         info = proc.info
         if not info.get("name"):
             continue
@@ -57,75 +82,65 @@ def get_process(name: str = None, top: int = None) -> list[dict]:
             continue
         if is_windows and info["name"] == "System Idle Process":
             continue
-        try:
-            proc.cpu_percent()  # Prime — first call always returns 0.0
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        procs.append((proc, info))
+        cpu_times = info.get("cpu_times")
+        cpu_total = (cpu_times.user + cpu_times.system) if cpu_times else 0.0
+        procs.append((proc, info, cpu_total))
 
-    # Build PID→name map from the full collected list for ParentProcessName lookup
-    pid_to_name: dict[int, str] = {
-        info["pid"]: info["name"]
-        for _, info in procs
-        if info.get("pid") is not None and info.get("name")
-    }
-
-    # Wait for the measurement interval
-    time.sleep(CPU_SAMPLE_INTERVAL)
-
-    # Pass 2: read accurate cpu_percent for each primed process
     results = []
-    for proc, info in procs:
-        try:
-            cpu = proc.cpu_percent()  # Accurate delta since pass 1
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            cpu = 0.0
-
-        # ExecutablePath — may raise AccessDenied on system processes
-        try:
-            exe_path = info.get("exe") or None
-        except Exception:
-            exe_path = None
-
-        mem_bytes = info["memory_info"].rss if info["memory_info"] else 0
-
-        start_time = None
-        if info["create_time"]:
-            try:
-                start_time = datetime.fromtimestamp(
-                    info["create_time"], tz=timezone.utc
-                ).isoformat()
-            except (OSError, ValueError, OverflowError):
-                pass
-
-        cmdline = " ".join(info["cmdline"]) if info["cmdline"] else None
-        status = STATUS_MAP.get(info.get("status", ""), "Unknown")
-        username = info["username"]
-        pid = info["pid"]
-        ppid = info.get("ppid")
-
+    for proc, info, cpu_total in procs:
         results.append({
             "ProcessName": info["name"],
-            "ProcessId": pid,
-            "ParentProcessId": ppid,
-            "ParentProcessName": pid_to_name.get(ppid) if ppid is not None else None,
-            "CpuPercent": round(cpu, 1),
-            "MemoryBytes": mem_bytes,
-            "MemoryPercent": round(info["memory_percent"], 1) if info["memory_percent"] else None,
-            "Status": status,
-            "User": username,
-            "ProcessType": _classify_process_type(username, pid),
-            "ExecutablePath": exe_path,
-            "Publisher": None,   # v1: populated in a future Windows enrichment pass
-            "ServiceName": None, # v1: populated in a future Windows enrichment pass
-            "StartTime": start_time,
-            "CommandLine": cmdline,
-            "ThreadCount": info["num_threads"],
+            "ProcessId": info["pid"],
+            "ParentProcessId": None,
+            "CpuPercent": 0.0,
+            "MemoryBytes": 0,
+            "MemoryPercent": None,
+            "Status": "Unknown",
+            "User": None,
+            "StartTime": None,
+            "CommandLine": None,
+            "ThreadCount": None,
+            "_cpu_total": cpu_total,
+            "_proc": proc,
         })
 
-    results.sort(key=lambda p: p["CpuPercent"], reverse=True)
+    results.sort(key=lambda p: p["_cpu_total"], reverse=True)
+
+    candidate_count = min(
+        len(results),
+        max(MIN_CANDIDATE_COUNT, (top or MIN_CANDIDATE_COUNT) * CPU_CANDIDATE_MULTIPLIER),
+    )
+    candidates = results[:candidate_count]
+
+    for result in candidates:
+        try:
+            result["_proc"].cpu_percent(interval=None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    time.sleep(CPU_SAMPLE_INTERVAL)
+
+    for result in candidates:
+        try:
+            cpu = result["_proc"].cpu_percent(interval=None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            cpu = 0.0
+        result["CpuPercent"] = round(cpu, 1)
+
+    results.sort(key=lambda p: (p["CpuPercent"], p["_cpu_total"]), reverse=True)
 
     if top:
         results = results[:top]
+
+    for result in results:
+        details = _get_process_details(result["_proc"])
+        result.update(details)
+
+    if not include_command_line:
+        for result in results:
+            result["CommandLine"] = None
+
+    for result in results:
+        result.pop("_proc", None)
 
     return results

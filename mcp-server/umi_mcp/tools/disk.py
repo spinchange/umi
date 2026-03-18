@@ -18,7 +18,7 @@ PSEUDO_FS = {
 }
 
 PSEUDO_MOUNTS = ("/proc", "/sys", "/dev", "/run", "/snap")
-WINDOWS_IO_TIMEOUT_SECONDS = 10
+WINDOWS_IO_TIMEOUT_SECONDS = 2
 IO_FIELD_NAMES = (
     "ReadCount",
     "WriteCount",
@@ -48,30 +48,7 @@ def _classify_volume_type(part) -> str:
 def _is_removable(part) -> bool:
     opts = (getattr(part, "opts", "") or "").lower()
     fstype = (part.fstype or "").lower()
-
-    if "cdrom" in opts or "removable" in opts or fstype in _REMOVABLE_FS:
-        return True
-
-    # Linux: authoritative source is /sys/class/block/<dev>/removable
-    if platform.system() == "Linux":
-        device = (part.device or "").split("/")[-1]
-        # Strip partition suffix to get the block device name (e.g. sda1 → sda)
-        sysfs_candidates = [device]
-        import re as _re
-        base = _re.sub(r"\d+$", "", device)
-        if base and base != device:
-            sysfs_candidates.append(base)
-        for dev_name in sysfs_candidates:
-            removable_path = f"/sys/class/block/{dev_name}/removable"
-            try:
-                with open(removable_path) as f:
-                    if f.read().strip() == "1":
-                        return True
-                break
-            except OSError:
-                continue
-
-    return False
+    return "cdrom" in opts or "removable" in opts or fstype in _REMOVABLE_FS
 
 
 def _null_io_fields() -> dict:
@@ -103,7 +80,7 @@ def _load_windows_drive_map() -> dict[str, str]:
             timeout=WINDOWS_IO_TIMEOUT_SECONDS,
             check=False,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return {}
 
     if out.returncode != 0 or not out.stdout.strip():
@@ -144,7 +121,7 @@ def _load_windows_label_map() -> dict[str, str | None]:
             timeout=WINDOWS_IO_TIMEOUT_SECONDS,
             check=False,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return {}
 
     if out.returncode != 0 or not out.stdout.strip():
